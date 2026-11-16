@@ -150,6 +150,14 @@ lazy_static! {
         "Messages dropped due to channel lag"
     ).expect("metric can be created");
 
+    /// Times a connection's bbo stream jumped to the current BBO of its
+    /// subscribed coins instead of replaying interim updates: after a channel
+    /// lag ("lagged") or with a large backlog of queued messages ("backlog").
+    pub static ref BBO_CONFLATIONS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("bbo_conflations_total", "Bbo streams jumped to the current BBO instead of replaying updates"),
+        &["reason"]
+    ).expect("metric can be created");
+
     /// New diffs whose insertBefore anchor was not resting at the level; the
     /// order was rested at the back of the level instead and a re-sync was
     /// scheduled, since queue priority may be wrong until then.
@@ -309,6 +317,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(PARSE_ERRORS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(WS_SEND_ERRORS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(CHANNEL_DROPS_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(BBO_CONFLATIONS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_DESYNCS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_FALLBACK_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_HONORED_TOTAL.clone())).ok();

@@ -460,6 +460,7 @@ curl http://localhost:9090/metrics
 | | `ws_send_errors_total` | WebSocket send errors |
 | | `channel_drops_total` | Messages dropped due to lag |
 | | `broadcast_channel_lag` | Broadcast channel lag (receivers behind) |
+| | `bbo_conflations_total{reason}` | Times a connection's `bbo` stream jumped to the current BBO of its subscribed coins instead of replaying interim updates: after a channel lag (`lagged`) or with more than 8192 messages queued (`backlog`) |
 | | `orderbook_desyncs_total{reason}` | Times the book was marked out-of-sync (each triggers an automatic background snapshot re-fetch). Alert on a sustained rate; occasional self-heals are benign |
 
 ### Disable Metrics
