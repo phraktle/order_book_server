@@ -10,7 +10,7 @@ use crate::{
     },
     order_book::{
         Coin, Px, PxBand, Side, Snapshot, Sz,
-        multi_book::{Snapshots, load_snapshots_from_cli_json},
+        multi_book::{Snapshots, load_snapshots_from_cli_json, load_snapshots_with_height},
     },
     prelude::*,
     types::{
@@ -94,6 +94,10 @@ fn fetch_snapshot(
         let res = match process_rmp_file(&snapshot_config).await {
             Ok(output_fln) => {
                 let snapshot = match pre_dump_height {
+                    // The info server's snapshot carries its own, exact height.
+                    _ if snapshot_config.mode == crate::SnapshotMode::Info => {
+                        load_snapshots_with_height::<InnerL4Order, (Address, L4Order)>(&output_fln).await
+                    }
                     Some(height) => {
                         load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, height).await
                     }

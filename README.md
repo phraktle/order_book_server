@@ -130,7 +130,7 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--snapshot-mode` | `docker` | `docker` or `direct` |
+| `--snapshot-mode` | `docker` | `docker`, `direct` or `info`. `info` asks the running node's info server (`--serve-info`, `http://localhost:3001/info`) for a snapshot of its current state, which carries its exact height; `docker` / `direct` dump the node's persisted `abci_state.rmp` and take the height from the visor state, which is only right while that file is as fresh as the visor height. In `info` mode the **node** writes `--snapshot-output-path` (default `/tmp/hl_snapshot.json`): it must be a path both processes see (not with `PrivateTmp=true`; with a node in Docker, a shared volume at the same path) |
 | `--docker-container` | `hyperliquid_hlnode` | Container name for `docker exec` (docker mode only) |
 | `--hlnode-binary` | `hl-node` | Path to hl-node binary on host (direct mode only) |
 | `--data-dir` | `~` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
