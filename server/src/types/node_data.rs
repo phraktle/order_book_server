@@ -119,6 +119,12 @@ impl<E> Batch<E> {
         self.events.len()
     }
 
+    /// When the node wrote the line (unix ms); the replay harness orders the streams by it.
+    #[cfg(test)]
+    pub(crate) fn local_time_ms(&self) -> i64 {
+        self.local_time.and_utc().timestamp_millis()
+    }
+
 }
 
 #[cfg(test)]

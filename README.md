@@ -130,7 +130,7 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--snapshot-mode` | `docker` | `docker` or `direct` |
+| `--snapshot-mode` | `docker` | `docker`, `direct` or `info`. `info` asks the running node's info server (`--serve-info`, `http://localhost:3001/info`) for a snapshot of its current state, which carries its exact height; `docker` / `direct` dump the node's persisted `abci_state.rmp` and take the height from the visor state, which is only right while that file is as fresh as the visor height. In `info` mode the **node** writes `--snapshot-output-path` (default `/tmp/hl_snapshot.json`): it must be a path both processes see (not with `PrivateTmp=true`; with a node in Docker, a shared volume at the same path) |
 | `--docker-container` | `hyperliquid_hlnode` | Container name for `docker exec` (docker mode only) |
 | `--hlnode-binary` | `hl-node` | Path to hl-node binary on host (direct mode only) |
 | `--data-dir` | `~` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
@@ -418,6 +418,15 @@ Dedup state is tracked per `(coin, nSigFigs, mantissa, nLevels)` tuple, so subsc
 | Savings when unchanged | ~500us |
 
 Fan-out payloads (trades, book diffs, L4 updates) are grouped per coin once in the listener and shared across all subscribed connections via `Arc`. The JSON wire frame for every channel - including `l2Book` (per `coin`/`nSigFigs`/`mantissa`/`nLevels` variant, covering the level-export and dedup-hash work too) and `bbo` - is built once per broadcast by the first subscribed connection; every other connection sends the same refcounted bytes zero-copy, so fan-out CPU no longer scales with the subscriber count. `TCP_NODELAY` is set on every accepted socket so small frames (BBO updates) are never delayed by Nagle's algorithm.
+
+### Checking the book against recorded node files
+
+`replay_recorded_streams_any_arrival_order_gives_the_nodes_book` (an ignored test) replays a recorded slice of the node's `node_raw_book_diffs_streaming` and `node_order_statuses_streaming` files (plain newline-delimited JSON, the same block range in both) through the real apply path under many arrival orders of the two streams, including a re-sync replay that overlaps the snapshot, and compares the resulting book with the one the diffs define (the resting orders, each one's side, price and size):
+
+```bash
+OBS_REPLAY_DIFFS=/path/diffs.jsonl OBS_REPLAY_STATUSES=/path/statuses.jsonl \
+    cargo test --release -p server replay_recorded_streams -- --ignored --nocapture
+```
 
 ## Prometheus Metrics
 

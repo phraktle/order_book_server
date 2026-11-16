@@ -79,6 +79,23 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
 
             output_path
         }
+        SnapshotMode::Info => {
+            // The node writes a snapshot of its CURRENT state to `outPath`, with
+            // that state's height: [height, markets].
+            let output_path =
+                config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
+            // A file left from an earlier fetch carries its own, old height.
+            let _unused = fs::remove_file(&output_path);
+            let payload = serde_json::json!({
+                "type": "fileSnapshot",
+                "request": { "type": "l4Snapshots", "includeUsers": true, "includeTriggerOrders": true },
+                "outPath": output_path,
+                "includeHeightInOutput": true
+            });
+            let request = reqwest::Client::new().post(crate::NODE_INFO_URL).json(&payload).send();
+            tokio::time::timeout(std::time::Duration::from_secs(120), request).await??.error_for_status()?;
+            output_path
+        }
         SnapshotMode::Direct => {
             // Direct mode: run hl-node directly on host
             let abci_path = config.abci_state_path.clone().unwrap_or_else(|| {
@@ -129,7 +146,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
 
     let dump_elapsed = dump_start.elapsed();
     RESYNC_PHASE_DURATION.with_label_values(&["fetch_dump"]).observe(dump_elapsed.as_secs_f64());
-    info!("hl-node compute-l4-snapshots completed in {}ms (mode: {:?})", dump_elapsed.as_millis(), config.mode);
+    info!("L4 snapshot dump completed in {}ms (mode: {:?})", dump_elapsed.as_millis(), config.mode);
 
     // Verify file exists
     if output_path.exists() {
