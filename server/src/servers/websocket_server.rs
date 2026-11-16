@@ -590,6 +590,17 @@ async fn run_session(
                         // suppresses sends whose payload didn't actually change).
                         force_full_l2 = true;
                         log::debug!("Receiver lagged: {n} messages");
+                        // l4Book / bookDiffs updates are incremental: with a gap
+                        // the client's book stays wrong. Close the connection
+                        // so it reconnects and takes a fresh snapshot.
+                        if manager.subscriptions().iter().any(Subscription::is_incremental_book) {
+                            log::warn!("Closing a connection that fell {n} messages behind on l4Book/bookDiffs");
+                            let msg = ServerResponse::Error(format!(
+                                "Fell {n} messages behind: l4Book/bookDiffs updates were dropped; reconnect and resubscribe"
+                            ));
+                            let _unused = outbound.send_message(msg).await;
+                            return;
+                        }
                     }
                     Err(err) => {
                         error!("Receiver error: {err}");

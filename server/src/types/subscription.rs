@@ -43,6 +43,12 @@ pub(crate) enum Subscription {
 }
 
 impl Subscription {
+    /// True for the streams a client rebuilds a book from: one missed update
+    /// leaves that book wrong until the client takes a new snapshot.
+    pub(crate) const fn is_incremental_book(&self) -> bool {
+        matches!(self, Self::L4Book { .. } | Self::BookDiffs { .. })
+    }
+
     pub(crate) fn validate(&self, universe: &HashSet<String>) -> bool {
         match self {
             Self::Trades { coin } => universe.contains(coin),
@@ -547,5 +553,16 @@ mod test {
 
         let response = serde_json::to_string(&ServerResponse::Pong).unwrap();
         assert_eq!(response, r#"{"channel":"pong"}"#);
+    }
+
+    #[test]
+    fn test_incremental_book_subscriptions() {
+        let coin = || "BTC".to_string();
+        assert!(Subscription::L4Book { coin: coin() }.is_incremental_book());
+        assert!(Subscription::BookDiffs { coin: coin() }.is_incremental_book());
+        // State channels heal on the next message; trades carry no state.
+        assert!(!Subscription::Bbo { coin: coin() }.is_incremental_book());
+        assert!(!Subscription::Trades { coin: coin() }.is_incremental_book());
+        assert!(!Subscription::L2Book { coin: coin(), n_sig_figs: None, n_levels: None, mantissa: None }.is_incremental_book());
     }
 }
