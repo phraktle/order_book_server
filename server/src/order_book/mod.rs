@@ -132,6 +132,25 @@ impl<O: InnerOrder> OrderBook<O> {
         false
     }
 
+    /// `add_order_before` without the matching, for orders from the node's diff
+    /// stream: they are already resting on the node, and every fill arrives as
+    /// the maker's own Update / Remove diff.
+    pub(crate) fn rest_order_before(&mut self, order: O, insert_before: Option<Oid>) -> bool {
+        if self.oid_to_side_px.contains_key(&order.oid()) {
+            log::warn!("OrderBook::rest_order called twice for oid={:?}; ignoring duplicate", order.oid());
+            return false;
+        }
+        if !order.sz().is_positive() {
+            return false;
+        }
+        let resting_book = match order.side() {
+            Side::Ask => &mut self.asks,
+            Side::Bid => &mut self.bids,
+        };
+        self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
+        add_order_to_book(resting_book, order, insert_before)
+    }
+
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {
         if let Some((side, px)) = self.oid_to_side_px.remove(&oid) {
             let map = match side {

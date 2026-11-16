@@ -54,19 +54,19 @@ impl<O: InnerOrder> OrderBooks<O> {
         }
     }
 
-    // Production always threads the diff's queue anchor through add_order_before;
+    // Production always threads the diff's queue anchor through rest_order_before;
     // this anchor-less shorthand survives for the many round-trip tests.
     #[cfg(test)]
     pub(crate) fn add_order(&mut self, order: O) {
-        let fell_back = self.add_order_before(order, None);
+        let fell_back = self.rest_order_before(order, None);
         debug_assert!(!fell_back);
     }
 
     // Returns true when `insert_before` could not be honored and the order was
-    // rested at the back of its level instead; see OrderBook::add_order_before.
-    pub(crate) fn add_order_before(&mut self, order: O, insert_before: Option<Oid>) -> bool {
+    // rested at the back of its level instead; see OrderBook::rest_order_before.
+    pub(crate) fn rest_order_before(&mut self, order: O, insert_before: Option<Oid>) -> bool {
         let coin = &order.coin();
-        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order_before(order, insert_before)
+        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).rest_order_before(order, insert_before)
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {

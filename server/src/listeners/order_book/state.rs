@@ -401,7 +401,7 @@ impl OrderBookState {
                 inner_order.convert_trigger(time.max(0) as u64);
                 let px = inner_order.limit_px();
                 let anchor = insert_before.clone();
-                if self.order_book.add_order_before(inner_order, insert_before) {
+                if self.order_book.rest_order_before(inner_order, insert_before) {
                     self.note_insert_before_fallback(&oid, &order_coin, anchor.as_ref(), px);
                 } else if anchor.is_some() {
                     crate::metrics::INSERT_BEFORE_HONORED_TOTAL.inc();
@@ -473,7 +473,7 @@ impl OrderBookState {
                         inner_order.convert_trigger(time.try_into().unwrap());
                         let px = inner_order.limit_px();
                         let anchor = insert_before.clone();
-                        if self.order_book.add_order_before(inner_order, insert_before) {
+                        if self.order_book.rest_order_before(inner_order, insert_before) {
                             self.note_insert_before_fallback(&oid, &order_coin, anchor.as_ref(), px);
                         } else if anchor.is_some() {
                             crate::metrics::INSERT_BEFORE_HONORED_TOTAL.inc();
@@ -1278,5 +1278,25 @@ mod tests {
         state.apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("ETH", 7, OrderDiff::Remove)])).unwrap();
         state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("ETH", 7, "open")])).unwrap();
         assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn test_new_diff_rests_without_matching() {
+        // A re-sync replay re-applies an order that the node placed and removed before the
+        // snapshot; it can cross the snapshot's book and must not consume resting orders.
+        let mut state = empty_state();
+        add_resting_order(&mut state, "ETH", 1); // bid 1.0 @ 100.0
+
+        let mut stale = make_order_status("ETH", 2, "open");
+        stale.order.side = crate::order_book::types::Side::Ask;
+        stale.order.limit_px = "99.0".to_string();
+        state.apply_order_statuses_hft(make_status_batch(vec![stale])).unwrap();
+        let new = make_order_diff("ETH", 2, OrderDiff::New { sz: "0.4".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        state.apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("ETH", 2, OrderDiff::Remove)])).unwrap();
+
+        let (_, _, snapshot) = state.compute_snapshot_for_coin(&Coin::new("ETH"), PxBand::default()).unwrap();
+        let bids: Vec<(Oid, String)> = snapshot.as_ref()[0].iter().map(|o| (o.oid(), o.sz().to_str())).collect();
+        assert_eq!(bids, vec![(Oid::new(1), "1".to_string())]);
     }
 }
