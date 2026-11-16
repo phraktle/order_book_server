@@ -60,13 +60,21 @@ fn load_statuses(path: &str) -> Vec<Rec> {
         .collect()
 }
 
-/// The diff records, and the book they define for orders created inside the
-/// slice. Spot is skipped like the server does (`ignore_spot`).
-fn load_diffs(path: &str) -> (Vec<Rec>, Resting) {
+/// The diff records, and the book they define: `book` (the orders resting at
+/// block `above`; empty for a bare slice) with every diff of a later block
+/// applied. Spot is skipped like the server does (`ignore_spot`). Also returns
+/// the diffs that do not fit the book they are applied to: the oids of a New
+/// for an order already resting, of an Update, and of a Remove for one that is
+/// not (a Remove right after an Update to zero is not counted).
+fn load_diffs(path: &str, mut book: Resting, above: u64) -> (Vec<Rec>, Resting, [Vec<Oid>; 3]) {
     let mut recs = Vec::new();
-    let mut book = Resting::new();
+    let mut misfits = [Vec::new(), Vec::new(), Vec::new()];
+    let mut zeroed = HashSet::new();
     for line in lines(path) {
         let b: Batch<NodeDataOrderDiff> = sonic_rs::from_str(&line).unwrap();
+        if b.block_number() <= above {
+            continue;
+        }
         let raw: RawLine = sonic_rs::from_str(&line).unwrap();
         for (diff, raw) in b.events_ref().iter().zip(&raw.events) {
             if diff.coin().is_spot() {
@@ -75,21 +83,31 @@ fn load_diffs(path: &str) -> (Vec<Rec>, Resting) {
             let oid = Oid::new(raw.oid);
             match diff.diff().try_into().unwrap() {
                 InnerOrderDiff::New { sz, .. } => {
-                    book.insert(oid, (raw.side, Px::parse_from_str(&raw.px).unwrap(), sz));
-                }
-                InnerOrderDiff::Update { new_sz, .. } if new_sz.value() > 0 => {
-                    if let Some(order) = book.get_mut(&oid) {
-                        order.2 = new_sz;
+                    let order = (raw.side, Px::parse_from_str(&raw.px).unwrap(), sz);
+                    if book.insert(oid.clone(), order).is_some() {
+                        misfits[0].push(oid);
                     }
                 }
-                InnerOrderDiff::Update { .. } | InnerOrderDiff::Remove => {
-                    book.remove(&oid);
+                InnerOrderDiff::Update { new_sz, .. } if new_sz.value() > 0 => match book.get_mut(&oid) {
+                    Some(order) => order.2 = new_sz,
+                    None => misfits[1].push(oid),
+                },
+                InnerOrderDiff::Update { .. } => {
+                    if book.remove(&oid).is_none() {
+                        misfits[1].push(oid.clone());
+                    }
+                    zeroed.insert(oid);
+                }
+                InnerOrderDiff::Remove => {
+                    if book.remove(&oid).is_none() && !zeroed.contains(&oid) {
+                        misfits[2].push(oid);
+                    }
                 }
             }
         }
         recs.push((b.block_number(), b.local_time_ms(), Ev::Diff(b)));
     }
-    (recs, book)
+    (recs, book, misfits)
 }
 
 fn resting(state: &OrderBookState) -> Resting {
@@ -159,7 +177,7 @@ fn replay_recorded_streams_any_arrival_order_gives_the_nodes_book() {
         println!("OBS_REPLAY_DIFFS / OBS_REPLAY_STATUSES not set; nothing to replay");
         return;
     };
-    let (diffs, want) = load_diffs(&diffs_path);
+    let (diffs, want, _) = load_diffs(&diffs_path, Resting::new(), 0);
     let statuses = load_statuses(&statuses_path);
     let (first, last) = (diffs.first().unwrap().0, diffs.last().unwrap().0);
     println!("{} diff lines, {} status lines, blocks {first}..={last}", diffs.len(), statuses.len());
@@ -216,4 +234,86 @@ fn replay_recorded_streams_any_arrival_order_gives_the_nodes_book() {
         }
     }
     assert!(failed.is_empty(), "the server's book differs from the node's for: {failed:?}");
+}
+
+/// A snapshot written by the node's info server (`--snapshot-mode info`:
+/// `[height, markets]`) loads with its own height into an uncrossed book.
+/// With stream files that start before that height (OBS_REPLAY_DIFFS /
+/// OBS_REPLAY_STATUSES) it also checks the handoff: every later diff fits the
+/// snapshot's book (so the height is the right cutoff), and snapshot + stream
+/// through the server gives the book that snapshot + diffs define.
+///
+/// ```bash
+/// OBS_SNAPSHOT_FILE=/path/snapshot.json [OBS_REPLAY_DIFFS=.. OBS_REPLAY_STATUSES=..] \
+///     cargo test --release -p server recorded_info_snapshot -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "needs a node info-server snapshot file: OBS_SNAPSHOT_FILE"]
+async fn recorded_info_snapshot_loads_and_hands_over_to_the_stream() {
+    use crate::order_book::multi_book::load_snapshots_with_height;
+    let Ok(path) = std::env::var("OBS_SNAPSHOT_FILE") else {
+        println!("OBS_SNAPSHOT_FILE not set; nothing to load");
+        return;
+    };
+    let load = || async {
+        let (height, snapshots, untriggered) = load_snapshots_with_height::<
+            InnerL4Order,
+            (alloy::primitives::Address, crate::types::L4Order),
+        >(std::path::Path::new(&path))
+        .await
+        .unwrap();
+        (height, OrderBookState::from_snapshot(snapshots, untriggered, height, 0, true, true, true))
+    };
+    let (height, state) = load().await;
+    let perps = state.order_book.as_ref().keys().filter(|coin| coin.is_perp()).count();
+    println!(
+        "snapshot at height {height}: {} books ({perps} perps), {} resting orders, {} untriggered, {} crossed books",
+        state.coin_count(),
+        state.order_count(),
+        state.untriggered_count(),
+        crossed_books(&state)
+    );
+    assert!(height > 0 && state.order_count() > 0 && perps > 0);
+    assert_eq!(crossed_books(&state), 0);
+
+    let (Ok(diffs_path), Ok(statuses_path)) = (std::env::var("OBS_REPLAY_DIFFS"), std::env::var("OBS_REPLAY_STATUSES"))
+    else {
+        return;
+    };
+    let (diffs, want, misfits) = load_diffs(&diffs_path, resting(&state), height);
+    let statuses: Vec<Rec> = load_statuses(&statuses_path).into_iter().filter(|r| r.0 > height).collect();
+    // Trigger orders never rest, but canceling one still emits a Remove diff:
+    // the snapshot's untriggered orders and the trigger statuses of the slice.
+    let mut triggers: HashSet<Oid> =
+        state.untriggered_orders.values().flat_map(|orders| orders.keys().cloned()).collect();
+    for (_, _, ev) in &statuses {
+        let Ev::Status(batch) = ev else { continue };
+        triggers.extend(batch.events_ref().iter().filter(|s| s.order.is_trigger).map(|s| Oid::new(s.order.oid)));
+    }
+    let stray_removes: Vec<&Oid> = misfits[2].iter().filter(|oid| !triggers.contains(oid)).collect();
+    println!(
+        "{} diff lines above the snapshot, blocks {}..={}; not fitting its book: {} new, {} update, {} remove \
+         (+ {} removes of trigger orders) {:?}",
+        diffs.len(),
+        diffs.first().unwrap().0,
+        diffs.last().unwrap().0,
+        misfits[0].len(),
+        misfits[1].len(),
+        stray_removes.len(),
+        misfits[2].len() - stray_removes.len(),
+        stray_removes.iter().take(5).collect::<Vec<_>>()
+    );
+    assert!(
+        misfits[0].is_empty() && misfits[1].is_empty() && stray_removes.is_empty(),
+        "the snapshot's height is not the stream cutoff"
+    );
+    let is_diff = |r: &Rec| matches!(r.2, Ev::Diff(_));
+    let block = |r: &Rec| i64::try_from(r.0).unwrap();
+    let mut ok = true;
+    for (label, diffs_first) in [("statuses first, per block", false), ("diffs first, per block", true)] {
+        let (_, mut state) = load().await;
+        feed(&mut state, interleave(&diffs, &statuses, &|r| (block(r), u8::from(is_diff(r) != diffs_first))));
+        ok &= compare(&state, &want, label);
+    }
+    assert!(ok, "snapshot + stream differs from snapshot + diffs");
 }
