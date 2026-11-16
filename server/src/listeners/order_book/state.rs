@@ -509,6 +509,10 @@ impl OrderBookState {
 }
 
 #[cfg(test)]
+#[path = "replay_tests.rs"]
+mod replay_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::order_book::multi_book::Snapshots;
