@@ -92,6 +92,34 @@ impl<O: InnerOrder> OrderBook<O> {
         }
     }
 
+    /// Rests an order that the node's book diff stream reports as resting
+    /// ("new"), exactly as given, WITHOUT matching it against the other side.
+    ///
+    /// The diff stream is the node's book: an order it reports as new did not
+    /// cross anything on the node, and every fill of a resting order comes as
+    /// that order's own Update / Remove diff. Matching here can only do harm.
+    /// It finds something to match only when this book is not the node's at
+    /// that moment - a stale order re-applied by a re-sync replay, or a
+    /// leftover of lost data - and then it shrinks or deletes resting orders
+    /// that the node still has, which no later diff restores.
+    pub(crate) fn rest_order(&mut self, order: O) {
+        // Same duplicate guard as add_order (a replayed New for an order that
+        // is already resting).
+        if self.oid_to_side_px.contains_key(&order.oid()) {
+            log::warn!("OrderBook::rest_order called twice for oid={:?}; ignoring duplicate", order.oid());
+            return;
+        }
+        if !order.sz().is_positive() {
+            return;
+        }
+        let resting_book = match order.side() {
+            Side::Ask => &mut self.asks,
+            Side::Bid => &mut self.bids,
+        };
+        self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
+        add_order_to_book(resting_book, order);
+    }
+
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {
         if let Some((side, px)) = self.oid_to_side_px.remove(&oid) {
             let map = match side {

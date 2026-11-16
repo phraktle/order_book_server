@@ -51,6 +51,13 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order(order);
     }
 
+    // The live / replay path for "new" book diffs: rests the order as the node
+    // reports it, without matching; see OrderBook::rest_order.
+    pub(crate) fn rest_order(&mut self, order: O) {
+        let coin = &order.coin();
+        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).rest_order(order);
+    }
+
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
         if let Some(book) = self.order_books.get_mut(&coin) {
             let success = book.cancel_order(oid.clone());

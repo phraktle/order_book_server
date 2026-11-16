@@ -150,6 +150,15 @@ lazy_static! {
         "Messages dropped due to channel lag"
     ).expect("metric can be created");
 
+    /// Orders the diff stream placed and removed again before their order
+    /// status arrived (same-block place + cancel, quote churn). They never
+    /// rest on the book. Before this was handled, each one stayed on the book
+    /// as a phantom order.
+    pub static ref PENDING_REMOVED_BEFORE_PAIRING_TOTAL: IntCounter = IntCounter::new(
+        "pending_removed_before_pairing_total",
+        "Orders removed by the diff stream before their order status arrived; never rested"
+    ).expect("metric can be created");
+
     // ==================== FILE WATCHER METRICS ====================
 
     /// File events received per source (orders, diffs, fills)
@@ -237,6 +246,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(WS_SEND_ERRORS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(CHANNEL_DROPS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_DESYNCS_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(PENDING_REMOVED_BEFORE_PAIRING_TOTAL.clone())).ok();
 
     // File watcher metrics
     REGISTRY.register(Box::new(FILE_EVENTS_TOTAL.clone())).ok();

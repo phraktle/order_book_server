@@ -27,7 +27,25 @@ pub(super) struct OrderBookState {
     pending_order_statuses: HashMap<Oid, (NodeDataOrderStatus, Instant)>,
     // Persistent cache of New diffs (sz values) waiting for their OrderStatuses
     // This is the other half of bidirectional caching - handles when Diff arrives BEFORE Status
-    pending_new_diffs: HashMap<Oid, (crate::order_book::types::Sz, Instant)>,
+    // The diff stream does not wait for the pairing: an Update or Remove for an
+    // oid that is still cached here is applied to the cached entry (see
+    // `PendingNewDiff`), so the order rests with its current size once the
+    // status arrives - or never rests if the node already removed it.
+    pending_new_diffs: HashMap<Oid, PendingNewDiff>,
+}
+
+/// A New diff waiting for its OrderStatus (the half that carries the order's
+/// details). The diff stream keeps running while it waits, so later diffs for
+/// the same oid land here instead of on the book.
+struct PendingNewDiff {
+    /// Resting size: the New diff's, replaced by any later Update.
+    sz: crate::order_book::types::Sz,
+    at: Instant,
+    /// The node took the order off its book again (Remove, or Update to zero)
+    /// before the status arrived. The entry stays as a tombstone so the late
+    /// status is consumed without resting the order: adding it then would
+    /// leave an order on the book that no later diff ever removes.
+    removed: bool,
 }
 
 impl OrderBookState {
@@ -124,7 +142,9 @@ impl OrderBookState {
     ///   `is_inserted_into_book() == true` whose order never rested, so no New
     ///   diff ever comes) - evicted silently, NOT data loss.
     /// - An aged-out `pending_new_diffs` entry means a New diff never got its
-    ///   status: the book is missing that order, which IS data loss.
+    ///   status: the book is missing that order, which IS data loss - unless
+    ///   the diff stream already removed the order again (a tombstone): the
+    ///   node's book does not hold it either, so nothing is missing.
     ///
     /// The size caps remain as an OOM backstop; hitting one still force-clears
     /// (fresh `HashMap::new()` so the high-water-mark bucket capacity is
@@ -150,9 +170,16 @@ impl OrderBookState {
             log::info!("Evicted {aged_statuses} aged pending_order_statuses entries (no matching BookDiff)");
         }
 
-        let before = self.pending_new_diffs.len();
-        self.pending_new_diffs.retain(|_, (_, at)| at.elapsed() < PENDING_MAX_AGE);
-        let aged_diffs = before - self.pending_new_diffs.len();
+        let mut aged_diffs = 0_usize;
+        self.pending_new_diffs.retain(|_, pending| {
+            if pending.at.elapsed() < PENDING_MAX_AGE {
+                return true;
+            }
+            if !pending.removed {
+                aged_diffs += 1;
+            }
+            false
+        });
         if aged_diffs > 0 {
             // A New diff with no status in 60s: the order is missing from the book.
             log::warn!("Evicted {aged_diffs} aged pending_new_diffs entries (status never arrived - data loss)");
@@ -219,14 +246,22 @@ impl OrderBookState {
             let oid = Oid::new(order_status.order.oid);
 
             // Check if there's a pending New diff for this order
-            if let Some((sz, _)) = self.pending_new_diffs.remove(&oid) {
+            if let Some(PendingNewDiff { sz, removed, .. }) = self.pending_new_diffs.remove(&oid) {
+                if removed {
+                    // The diff stream placed AND removed this order before its
+                    // status got here: it is not on the node's book. Resting it
+                    // now would leave a phantom that nothing ever removes.
+                    crate::metrics::PENDING_REMOVED_BEFORE_PAIRING_TOTAL.inc();
+                    log::debug!("Order not added (removed before its status arrived): oid={oid:?}");
+                    continue;
+                }
                 // Both arrived - add order immediately!
                 let time = order_status.time.and_utc().timestamp_millis();
                 let order_coin = Coin::new(&order_status.order.coin);
                 let mut inner_order: InnerL4Order = order_status.try_into()?;
                 inner_order.modify_sz(sz);
                 inner_order.convert_trigger(time.max(0) as u64);
-                self.order_book.add_order(inner_order);
+                self.order_book.rest_order(inner_order);
                 changed_coins.insert(order_coin.clone());
                 log::debug!("Order added (status arrived after diff): oid={:?} coin={:?}", oid, order_coin);
             } else if order_status.is_inserted_into_book() {
@@ -250,8 +285,8 @@ impl OrderBookState {
         for (_, at) in self.pending_order_statuses.values_mut() {
             *at = backdated;
         }
-        for (_, at) in self.pending_new_diffs.values_mut() {
-            *at = backdated;
+        for pending in self.pending_new_diffs.values_mut() {
+            pending.at = backdated;
         }
     }
 
@@ -292,20 +327,38 @@ impl OrderBookState {
                         inner_order.modify_sz(sz);
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
-                        self.order_book.add_order(inner_order);
+                        self.order_book.rest_order(inner_order);
                         changed_coins.insert(order_coin.clone());
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
                     } else {
                         // Status hasn't arrived yet - cache the diff size
-                        self.pending_new_diffs.insert(oid.clone(), (sz, Instant::now()));
+                        self.pending_new_diffs
+                            .insert(oid.clone(), PendingNewDiff { sz, at: Instant::now(), removed: false });
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
-                    let _ = self.order_book.modify_sz(oid, coin.clone(), new_sz);
+                    if !self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz)
+                        && let Some(pending) = self.pending_new_diffs.get_mut(&oid)
+                    {
+                        // The order is not on the book yet (its status is still
+                        // on the way): keep the cached half current instead of
+                        // dropping the update.
+                        if new_sz.value() == 0 {
+                            pending.removed = true;
+                        } else {
+                            pending.sz = new_sz;
+                        }
+                    }
                     changed_coins.insert(coin);
                 }
                 InnerOrderDiff::Remove => {
-                    let _ = self.order_book.cancel_order(oid.clone(), coin.clone());
+                    if !self.order_book.cancel_order(oid.clone(), coin.clone())
+                        && let Some(pending) = self.pending_new_diffs.get_mut(&oid)
+                    {
+                        // Removed before its status arrived: remember it, so
+                        // the late status does not rest the order.
+                        pending.removed = true;
+                    }
                     changed_coins.insert(coin);
                 }
             }
@@ -313,6 +366,10 @@ impl OrderBookState {
         Ok(changed_coins)
     }
 }
+
+#[cfg(test)]
+#[path = "replay_tests.rs"]
+mod replay_tests;
 
 #[cfg(test)]
 mod tests {
@@ -705,5 +762,158 @@ mod tests {
         assert!(universe.contains(&Coin::new("BTC")));
         assert!(universe.contains(&Coin::new("ETH")));
         assert!(universe.contains(&Coin::new("SOL")));
+    }
+
+    fn add_resting_order(state: &mut OrderBookState, coin: &str, oid: u64) {
+        let status = make_order_status(coin, oid, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let diff = make_order_diff(coin, oid, OrderDiff::New { sz: "1.0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+    }
+
+    /// Bid-side queue order (front first) for the coin's single price level.
+    fn bid_queue_oids(state: &OrderBookState, coin: &str) -> Vec<Oid> {
+        let (_, _, snapshot) = state.compute_snapshot_for_coin(&Coin::new(coin)).unwrap();
+        snapshot.as_ref()[0].iter().map(InnerOrder::oid).collect()
+    }
+
+    // ==================== Diffs outrunning the status pairing ====================
+    //
+    // The two streams come through independent file watchers, so the diff
+    // stream can be several events ahead of the status stream. An Update or
+    // Remove that arrives while the order's New diff is still waiting for its
+    // status must not be lost.
+
+    // A real case: HYPER oid 606674974230 on mainnet, block 1222996474
+    // (2026-11-16 04:46:01 UTC). An ALO bid was placed and canceled in the
+    // same block; the node wrote the four lines within 13 ms. The production
+    // server (which read "new" and "remove" before the "open" status) still
+    // had the bid resting at 0.039969 36 minutes later (05:22 UTC).
+    const REAL_DIFF_NEW: &str = r#"{"local_time":"2026-11-16T04:46:02.191876285","block_time":"2026-11-16T04:46:01.988728056","block_number":1222996474,"events":[{"user":"0x4e60e3a4a32d63d245aa4e4ce304b4254b088f95","oid":606674974230,"coin":"HYPER","side":"B","px":"0.039969","raw_book_diff":{"new":{"sz":"10008.0"}}}]}"#;
+    const REAL_STATUS_OPEN: &str = r#"{"local_time":"2026-11-16T04:46:02.191878695","block_time":"2026-11-16T04:46:01.988728056","block_number":1222996474,"events":[{"time":"2026-11-16T04:46:01.988728056","user":"0x4e60e3a4a32d63d245aa4e4ce304b4254b088f95","hash":"0x676187c31935a43768db0448e571fa02028100a8b438c3090b2a3315d8397e22","builder":null,"status":"open","order":{"coin":"HYPER","side":"B","limitPx":"0.039969","sz":"10008.0","oid":606674974230,"timestamp":1794804361988,"triggerCondition":"N/A","isTrigger":false,"triggerPx":"0.0","children":[],"isPositionTpsl":false,"reduceOnly":false,"orderType":"Limit","origSz":"10008.0","tif":"Alo","cloid":"0x6781350000000000bf00000000000000"}}]}"#;
+    const REAL_DIFF_REMOVE: &str = r#"{"local_time":"2026-11-16T04:46:02.204325910","block_time":"2026-11-16T04:46:01.988728056","block_number":1222996474,"events":[{"user":"0x4e60e3a4a32d63d245aa4e4ce304b4254b088f95","oid":606674974230,"coin":"HYPER","side":"B","px":"0.039969","raw_book_diff":"remove"}]}"#;
+    const REAL_STATUS_CANCELED: &str = r#"{"local_time":"2026-11-16T04:46:02.204328130","block_time":"2026-11-16T04:46:01.988728056","block_number":1222996474,"events":[{"time":"2026-11-16T04:46:01.988728056","user":"0x4e60e3a4a32d63d245aa4e4ce304b4254b088f95","hash":null,"builder":null,"status":"canceled","order":{"coin":"HYPER","side":"B","limitPx":"0.039969","sz":"10008.0","oid":606674974230,"timestamp":1794804361988,"triggerCondition":"N/A","isTrigger":false,"triggerPx":"0.0","children":[],"isPositionTpsl":false,"reduceOnly":false,"orderType":"Limit","origSz":"10008.0","tif":"Alo","cloid":"0x6781350000000000bf00000000000000"}}]}"#;
+
+    fn apply_line(state: &mut OrderBookState, line: &str) {
+        if line.contains("raw_book_diff") {
+            state.apply_order_diffs_hft(serde_json::from_str(line).unwrap()).unwrap();
+        } else {
+            state.apply_order_statuses_hft(serde_json::from_str(line).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_real_place_and_cancel_in_one_block_leaves_no_phantom_in_any_arrival_order() {
+        // Every merge of the two streams that keeps each stream's own order.
+        let arrival_orders = [
+            // both diffs before any status: the order that left the phantom
+            [REAL_DIFF_NEW, REAL_DIFF_REMOVE, REAL_STATUS_OPEN, REAL_STATUS_CANCELED],
+            [REAL_DIFF_NEW, REAL_STATUS_OPEN, REAL_DIFF_REMOVE, REAL_STATUS_CANCELED],
+            [REAL_DIFF_NEW, REAL_STATUS_OPEN, REAL_STATUS_CANCELED, REAL_DIFF_REMOVE],
+            [REAL_STATUS_OPEN, REAL_DIFF_NEW, REAL_DIFF_REMOVE, REAL_STATUS_CANCELED],
+            [REAL_STATUS_OPEN, REAL_DIFF_NEW, REAL_STATUS_CANCELED, REAL_DIFF_REMOVE],
+            [REAL_STATUS_OPEN, REAL_STATUS_CANCELED, REAL_DIFF_NEW, REAL_DIFF_REMOVE],
+        ];
+        for (i, lines) in arrival_orders.iter().enumerate() {
+            let mut state = empty_state();
+            for line in lines {
+                apply_line(&mut state, line);
+            }
+            assert_eq!(state.order_count(), 0, "arrival order #{i}: the canceled order must not rest");
+            assert_eq!(state.pending_new_diffs_count(), 0, "arrival order #{i}");
+            assert_eq!(state.pending_order_statuses_count(), 0, "arrival order #{i}");
+        }
+    }
+
+    fn best_bid_sz(state: &OrderBookState, coin: &str) -> Option<String> {
+        let coin = Coin::new(coin);
+        let (_, bbos) = state.get_bbos_for_coins(&std::iter::once(coin.clone()).collect());
+        bbos.get(&coin).and_then(|(bid, _)| bid.map(|(_, sz, _)| sz.to_str()))
+    }
+
+    #[test]
+    fn test_update_before_status_rests_with_the_updated_size() {
+        let mut state = empty_state();
+        // Placed (2.0) and partly filled (1.25 left) before the status arrives
+        let new = make_order_diff("ETH", 7, OrderDiff::New { sz: "2.0".to_string() });
+        let update =
+            make_order_diff("ETH", 7, OrderDiff::Update { orig_sz: "2.0".to_string(), new_sz: "1.25".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new, update])).unwrap();
+        assert_eq!(state.order_count(), 0);
+
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("ETH", 7, "open")])).unwrap();
+        assert_eq!(state.order_count(), 1);
+        assert_eq!(best_bid_sz(&state, "ETH").as_deref(), Some("1.25"), "the size left on the node's book");
+    }
+
+    #[test]
+    fn test_update_to_zero_before_status_never_rests() {
+        let mut state = empty_state();
+        let new = make_order_diff("ETH", 7, OrderDiff::New { sz: "2.0".to_string() });
+        let update =
+            make_order_diff("ETH", 7, OrderDiff::Update { orig_sz: "2.0".to_string(), new_sz: "0.0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new, update])).unwrap();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("ETH", 7, "open")])).unwrap();
+        assert_eq!(state.order_count(), 0);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+    }
+
+    #[test]
+    fn test_removed_before_status_ages_out_without_data_loss() {
+        let mut state = empty_state();
+        let new = make_order_diff("ETH", 7, OrderDiff::New { sz: "2.0".to_string() });
+        let remove = make_order_diff("ETH", 7, OrderDiff::Remove);
+        state.apply_order_diffs_hft(make_diff_batch(vec![new, remove])).unwrap();
+        assert_eq!(state.pending_new_diffs_count(), 1, "kept as a tombstone for the late status");
+
+        // The status never arrives. The node's book does not hold the order
+        // either, so evicting the tombstone is not data loss (no re-sync).
+        state.age_pending_entries(Duration::from_secs(61));
+        assert!(!state.cleanup_stale_pending());
+        assert_eq!(state.pending_new_diffs_count(), 0);
+
+        // A New diff whose status never arrives still IS data loss.
+        let new = make_order_diff("ETH", 8, OrderDiff::New { sz: "2.0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        state.age_pending_entries(Duration::from_secs(61));
+        assert!(state.cleanup_stale_pending());
+    }
+
+    #[test]
+    fn test_remove_before_status_does_not_touch_other_orders() {
+        let mut state = empty_state();
+        add_resting_order(&mut state, "ETH", 1);
+        let new = make_order_diff("ETH", 2, OrderDiff::New { sz: "3.0".to_string() });
+        let remove = make_order_diff("ETH", 2, OrderDiff::Remove);
+        state.apply_order_diffs_hft(make_diff_batch(vec![new, remove])).unwrap();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("ETH", 2, "open")])).unwrap();
+        assert_eq!(bid_queue_oids(&state, "ETH"), vec![Oid::new(1)]);
+        assert_eq!(best_bid_sz(&state, "ETH").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn test_new_diff_rests_without_matching() {
+        // A re-sync replays cached events from below the snapshot's height, so
+        // an order that the node placed and removed BEFORE the snapshot is
+        // applied again on top of it, and can cross the snapshot's book (the
+        // market moved since). It must not eat resting orders: the node still
+        // has them, and no later diff would restore them.
+        let mut state = empty_state();
+        add_resting_order(&mut state, "ETH", 1); // bid 1.0 @ 100.0
+
+        let mut stale = make_order_status("ETH", 2, "open");
+        stale.order.side = crate::order_book::types::Side::Ask;
+        stale.order.limit_px = "99.0".to_string();
+        state.apply_order_statuses_hft(make_status_batch(vec![stale])).unwrap();
+        let new = make_order_diff("ETH", 2, OrderDiff::New { sz: "0.4".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        assert_eq!(state.order_count(), 2);
+        assert_eq!(best_bid_sz(&state, "ETH").as_deref(), Some("1"), "the resting bid is untouched");
+
+        // ... and the replay then removes the stale order, as the node did.
+        state.apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("ETH", 2, OrderDiff::Remove)])).unwrap();
+        assert_eq!(bid_queue_oids(&state, "ETH"), vec![Oid::new(1)]);
+        assert_eq!(best_bid_sz(&state, "ETH").as_deref(), Some("1"));
     }
 }
