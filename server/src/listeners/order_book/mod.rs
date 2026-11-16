@@ -88,16 +88,17 @@ fn fetch_snapshot(
         // add/cancel inside it - permanent anchor holes and phantom orders,
         // re-seeded at every install.
         let visor_path = get_visor_path(&snapshot_config);
-        let pre_dump_height = read_visor_height(&visor_path);
+        // Info mode needs no cutoff from outside: its snapshot carries its own height.
+        let info_mode = snapshot_config.mode == crate::SnapshotMode::Info;
+        let pre_dump_height = if info_mode { None } else { read_visor_height(&visor_path) };
 
         // Now generate snapshot - any events during this time are cached
         let res = match process_rmp_file(&snapshot_config).await {
             Ok(output_fln) => {
-                let snapshot = match pre_dump_height {
-                    Some(height) => {
-                        load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, height).await
-                    }
-                    None => Err("visor state height unavailable before dump".into()),
+                let snapshot = if info_mode || pre_dump_height.is_some() {
+                    load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, pre_dump_height).await
+                } else {
+                    Err("visor state height unavailable before dump".into())
                 };
                 info!("Snapshot fetched");
                 match snapshot {

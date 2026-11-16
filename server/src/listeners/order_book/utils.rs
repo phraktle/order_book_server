@@ -79,6 +79,38 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
 
             output_path
         }
+        SnapshotMode::Info => {
+            // The node writes a snapshot of its CURRENT state, with that state's
+            // height in the output: [height, markets]. The docker / direct modes
+            // dump the node's last persisted state file instead, which the node
+            // rewrites only periodically.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let output_path =
+                config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
+            let body = serde_json::json!({
+                "type": "fileSnapshot",
+                "request": { "type": "l4Snapshots", "includeUsers": true, "includeTriggerOrders": true },
+                "outPath": output_path,
+                "includeHeightInOutput": true
+            })
+            .to_string();
+            let addr = crate::NODE_INFO_ADDR;
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            let head = format!(
+                "POST /info HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream.write_all(body.as_bytes()).await?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
+            let response = String::from_utf8_lossy(&response);
+            if !response.starts_with("HTTP/1.1 200") {
+                error!("node info server fileSnapshot failed: {}", response.chars().take(300).collect::<String>());
+                return Err("node info server fileSnapshot failed".into());
+            }
+            output_path
+        }
         SnapshotMode::Direct => {
             // Direct mode: run hl-node directly on host
             let abci_path = config.abci_state_path.clone().unwrap_or_else(|| {

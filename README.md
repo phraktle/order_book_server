@@ -130,7 +130,7 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--snapshot-mode` | `docker` | `docker` or `direct` |
+| `--snapshot-mode` | `docker` | `docker`, `direct` or `info`. `info` asks the running node's info server (`--serve-info`, `127.0.0.1:3001`) for a snapshot of its current state, which carries its exact height. `docker` / `direct` dump the node's persisted `abci_state.rmp` and stamp it with the node's current height: if the node rewrites that file only periodically, every event between the file's height and the current height is missing from the book until the next re-sync |
 | `--docker-container` | `hyperliquid_hlnode` | Container name for `docker exec` (docker mode only) |
 | `--hlnode-binary` | `hl-node` | Path to hl-node binary on host (direct mode only) |
 | `--data-dir` | `~` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
