@@ -4,7 +4,7 @@ use crate::{
         L2SnapshotParams, OrderBookListener, hl_listen_hft,
     },
     metrics::{
-        BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
+        BBO_CHANGES_TOTAL, BBO_CONFLATIONS_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
         LAST_EVENT_APPLIED_MS, MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, ORDERBOOK_READY, WS_CONNECTIONS_ACTIVE,
         WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
     },
@@ -482,6 +482,7 @@ async fn run_session(
     // carried dirty coins this connection never saw, so the next Snapshot must
     // re-evaluate every subscription instead of trusting the dirty-set skip.
     let mut force_full_l2 = false;
+    let mut bbo_conflation = BboConflation::new(BBO_CONFLATE_BACKLOG);
     while alive {
         select! {
             recv_result = internal_message_rx.recv() => {
@@ -501,14 +502,8 @@ async fn run_session(
                                 }
                                 force_full_l2 = false;
                             },
-                            InternalMessage::BboUpdate{ bbos, time } => {
-                                // Fast path for BBO subscribers only
-                                for sub in manager.subscriptions() {
-                                    if !alive { break; }
-                                    if let Subscription::Bbo { coin } = sub {
-                                        alive &= send_ws_data_from_bbo(outbound, coin, bbos, *time, last_bbo, bbo_hb.is_some()).await;
-                                    }
-                                }
+                            InternalMessage::BboUpdate{ bbos, time, seq } => {
+                                alive &= on_bbo_update(outbound, manager, listener, internal_message_rx, &mut bbo_conflation, bbos, *time, *seq, last_bbo, bbo_hb.is_some()).await;
                             },
                             InternalMessage::Fills{ trades_by_coin } => {
                                 // Per-coin payloads were grouped once in the listener; the
@@ -590,6 +585,13 @@ async fn run_session(
                         // suppresses sends whose payload didn't actually change).
                         force_full_l2 = true;
                         log::debug!("Receiver lagged: {n} messages");
+                        // The dropped `BboUpdate`s may have carried this connection's
+                        // last change for a coin: jump every bbo subscription to the
+                        // current BBO now (the replayed backlog is all older).
+                        if let Some(ok) = jump_bbo_to_current(outbound, manager, listener, &mut bbo_conflation, last_bbo, bbo_hb.is_some()).await {
+                            BBO_CONFLATIONS_TOTAL.with_label_values(&["lagged"]).inc();
+                            alive &= ok;
+                        }
                     }
                     Err(err) => {
                         error!("Receiver error: {err}");
@@ -859,6 +861,113 @@ async fn send_ws_data_from_bbo(
         }
     }
     true
+}
+
+/// Messages a connection may have queued in the broadcast channel before its
+/// bbo stream skips ahead: past this backlog every bbo subscription jumps to
+/// the current BBO and the interim `BboUpdate`s are dropped instead of replayed
+/// (~0.5 s at the mainnet average `BboUpdate` rate).
+const BBO_CONFLATE_BACKLOG: usize = 8192;
+/// `BboUpdate`s between backlog checks: `Receiver::len` takes the channel's tail
+/// lock, which every listener send also takes.
+const BBO_BACKLOG_CHECK_EVERY: u32 = 256;
+
+/// Per-connection bbo conflation state: a connection behind the event stream
+/// sends each subscribed coin's last known BBO instead of the interim updates.
+struct BboConflation {
+    /// `BboUpdate`s with `seq <= floor` are no newer than the BBOs this connection
+    /// last jumped to, so they are skipped.
+    floor: u64,
+    until_check: u32,
+    backlog_limit: usize,
+}
+
+impl BboConflation {
+    const fn new(backlog_limit: usize) -> Self {
+        Self { floor: 0, until_check: 0, backlog_limit }
+    }
+
+    /// True (at most once per `BBO_BACKLOG_CHECK_EVERY` calls) when the receiver
+    /// has more than `backlog_limit` messages queued.
+    fn backed_up(&mut self, rx: &tokio::sync::broadcast::Receiver<Arc<InternalMessage>>) -> bool {
+        if self.until_check > 0 {
+            self.until_check -= 1;
+            return false;
+        }
+        self.until_check = BBO_BACKLOG_CHECK_EVERY - 1;
+        rx.len() > self.backlog_limit
+    }
+}
+
+/// Jump every bbo subscription of this connection to its coin's current BBO
+/// (deduped against what the connection last got) and skip the `BboUpdate`s that
+/// predate it. Returns `None` (nothing sent, nothing skipped) when there are no
+/// bbo subscriptions or no book; otherwise whether the connection is alive.
+async fn jump_bbo_to_current(
+    outbound: &Outbound,
+    manager: &SubscriptionManager,
+    listener: &Arc<Mutex<OrderBookListener>>,
+    conflation: &mut BboConflation,
+    last_bbo: &mut HashMap<String, BboEntry>,
+    store_payload: bool,
+) -> Option<bool> {
+    let coins: HashSet<Coin> = manager
+        .subscriptions()
+        .iter()
+        .filter_map(|sub| if let Subscription::Bbo { coin } = sub { Some(Coin::new(coin)) } else { None })
+        .collect();
+    if coins.is_empty() {
+        return None;
+    }
+    let (seq, time, bbos) = listener.lock().await.current_bbos(&coins)?;
+    conflation.floor = conflation.floor.max(seq);
+    let mut alive = true;
+    for sub in manager.subscriptions() {
+        if !alive {
+            break;
+        }
+        if let Subscription::Bbo { coin } = sub {
+            alive &= send_ws_data_from_bbo(outbound, coin, &bbos, time, last_bbo, store_payload).await;
+        }
+    }
+    Some(alive)
+}
+
+/// Handle one `BboUpdate` for this connection: skip it when an earlier jump
+/// already covered it, jump to the current BBOs when the connection is backed
+/// up, otherwise send the changed coins it subscribes to.
+#[allow(clippy::too_many_arguments)]
+async fn on_bbo_update(
+    outbound: &Outbound,
+    manager: &SubscriptionManager,
+    listener: &Arc<Mutex<OrderBookListener>>,
+    rx: &tokio::sync::broadcast::Receiver<Arc<InternalMessage>>,
+    conflation: &mut BboConflation,
+    bbos: &HashMap<Coin, CoinBbo>,
+    time: u64,
+    seq: u64,
+    last_bbo: &mut HashMap<String, BboEntry>,
+    store_payload: bool,
+) -> bool {
+    if seq <= conflation.floor {
+        return true;
+    }
+    if conflation.backed_up(rx)
+        && let Some(alive) = jump_bbo_to_current(outbound, manager, listener, conflation, last_bbo, store_payload).await
+    {
+        BBO_CONFLATIONS_TOTAL.with_label_values(&["backlog"]).inc();
+        return alive;
+    }
+    let mut alive = true;
+    for sub in manager.subscriptions() {
+        if !alive {
+            break;
+        }
+        if let Subscription::Bbo { coin } = sub {
+            alive &= send_ws_data_from_bbo(outbound, coin, bbos, time, last_bbo, store_payload).await;
+        }
+    }
+    alive
 }
 
 /// Per-send timeout. A slow or hostile client whose TCP receive window stays full
@@ -1660,6 +1769,125 @@ mod tests {
         assert!(outbound.send_payload(bytes::Bytes::from_static(b"x")).await);
         writer.await.unwrap();
         assert!(!outbound.send_payload(bytes::Bytes::from_static(b"y")).await);
+    }
+
+    /// Drive a connection's bbo path over everything queued on `rx`, the way
+    /// `run_session` does (with or without the post-lag jump), and return the
+    /// (coin, bid size) of every bbo frame it sent, in order.
+    async fn run_bbo_session(
+        listener: &Arc<Mutex<OrderBookListener>>,
+        rx: &mut tokio::sync::broadcast::Receiver<Arc<InternalMessage>>,
+        coins: &[&str],
+        mut conflation: BboConflation,
+        jump_on_lag: bool,
+    ) -> (bool, Vec<(String, f64)>) {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let (data_tx, mut data_rx) = mpsc::channel(1024);
+        let (pong_tx, _pong_rx) = mpsc::channel(8);
+        let outbound = Outbound { data_tx, pong_tx };
+        let mut manager = SubscriptionManager::default();
+        for coin in coins {
+            manager.subscribe(Subscription::Bbo { coin: (*coin).to_string() }).unwrap();
+        }
+        let mut last_bbo = HashMap::new();
+        let mut lagged = false;
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    if let InternalMessage::BboUpdate { bbos, time, seq } = msg.as_ref() {
+                        let ok = on_bbo_update(
+                            &outbound,
+                            &manager,
+                            listener,
+                            rx,
+                            &mut conflation,
+                            bbos,
+                            *time,
+                            *seq,
+                            &mut last_bbo,
+                            false,
+                        )
+                        .await;
+                        assert!(ok);
+                    }
+                }
+                Err(TryRecvError::Lagged(_)) => {
+                    lagged = true;
+                    if jump_on_lag {
+                        let jumped =
+                            jump_bbo_to_current(&outbound, &manager, listener, &mut conflation, &mut last_bbo, false)
+                                .await;
+                        assert_eq!(jumped, Some(true));
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        drop(outbound);
+        let mut frames = Vec::new();
+        while let Ok(frame) = data_rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(v["channel"], "bbo");
+            let sz: f64 = v["data"]["bid"]["sz"].as_str().unwrap().parse().unwrap();
+            frames.push((v["data"]["coin"].as_str().unwrap().to_string(), sz));
+        }
+        (lagged, frames)
+    }
+
+    fn last_sz(frames: &[(String, f64)], coin: &str) -> Option<f64> {
+        frames.iter().rev().find(|(c, _)| c == coin).map(|(_, sz)| *sz)
+    }
+
+    /// BTC moves 10 times, then ETH 10 times, through a 4-slot channel: BTC's
+    /// last `BboUpdate`s are evicted by ETH's before the connection reads them.
+    async fn lagged_btc_then_eth(jump_on_lag: bool) -> (bool, Vec<(String, f64)>) {
+        use crate::listeners::order_book::tests::{bbo_listener, feed_order};
+        let (mut listener, mut rx, _guards) = bbo_listener(4);
+        for oid in 1..=10 {
+            feed_order(&mut listener, "BTC", oid, oid);
+        }
+        for oid in 11..=20 {
+            feed_order(&mut listener, "ETH", oid, oid);
+        }
+        let listener = Arc::new(Mutex::new(listener));
+        run_bbo_session(&listener, &mut rx, &["BTC", "ETH"], BboConflation::new(usize::MAX), jump_on_lag).await
+    }
+
+    #[tokio::test]
+    async fn test_lagged_bbo_connection_ends_with_current_quote() {
+        // Each order adds 1.0 at the same bid, so the current BBO is size 10 on
+        // both coins. Without the jump the lagged connection keeps a stale BTC
+        // quote (the test's control); with it, every coin ends current.
+        let (lagged, stale) = lagged_btc_then_eth(false).await;
+        assert!(lagged, "the 4-slot channel must lag");
+        assert_ne!(last_sz(&stale, "BTC"), Some(10.0), "control: without the jump BTC is stale");
+
+        let (lagged, frames) = lagged_btc_then_eth(true).await;
+        assert!(lagged);
+        assert_eq!(last_sz(&frames, "BTC"), Some(10.0), "BTC ends on its current quote");
+        assert_eq!(last_sz(&frames, "ETH"), Some(10.0), "ETH ends on its current quote");
+        // The backlog replayed after the jump is older than the jump: it must be
+        // skipped, never regress a quote the client already has.
+        for coin in ["BTC", "ETH"] {
+            let sizes: Vec<f64> = frames.iter().filter(|(c, _)| c == coin).map(|(_, sz)| *sz).collect();
+            assert!(sizes.windows(2).all(|w| w[0] < w[1]), "{coin} quote regressed: {sizes:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backed_up_bbo_connection_jumps_to_current_quote() {
+        // No lag, but 20 `BboUpdate`s queued past the backlog limit: the
+        // connection sends the current quote once and skips the interim ones.
+        use crate::listeners::order_book::tests::{bbo_listener, feed_order};
+        let (mut listener, mut rx, _guards) = bbo_listener(64);
+        for oid in 1..=20 {
+            feed_order(&mut listener, "BTC", oid, oid);
+        }
+        let listener = Arc::new(Mutex::new(listener));
+        let (lagged, frames) = run_bbo_session(&listener, &mut rx, &["BTC"], BboConflation::new(4), true).await;
+        assert!(!lagged);
+        assert_eq!(frames, vec![("BTC".to_string(), 20.0)]);
     }
 
     #[test]

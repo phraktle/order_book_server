@@ -394,6 +394,8 @@ pub(crate) struct OrderBookListener {
     // this is what lets a brand-new subscriber be served within one throttle window
     // even on an otherwise-quiet coin.
     last_active_l2_params: HashSet<L2SnapshotParams>,
+    // Sequence number of the last `BboUpdate` broadcast (see `current_bbos`).
+    bbo_seq: u64,
 }
 
 impl OrderBookListener {
@@ -427,7 +429,21 @@ impl OrderBookListener {
             active_l2_params,
             active_subs: ActiveSubs::default(),
             last_active_l2_params: HashSet::new(),
+            bbo_seq: 0,
         }
+    }
+
+    /// The current BBO of each of `coins`, the book time, and the sequence
+    /// number of the last `BboUpdate` broadcast, read together under the
+    /// listener lock. `BboUpdate`s are sent under the same lock right after the
+    /// change they carry is applied, so every `BboUpdate` with `seq <=` the
+    /// returned one is no newer than these values: a connection that jumps to
+    /// them can skip those updates. `None` while no book is installed.
+    pub(crate) fn current_bbos(&self, coins: &HashSet<Coin>) -> Option<(u64, u64, HashMap<Coin, CoinBbo>)> {
+        let state = self.order_book_state.as_ref()?;
+        let (time, bbos) = state.get_bbos_for_coins(coins);
+        let bbos = bbos.into_iter().map(|(coin, raw)| (coin, CoinBbo { raw, frame: SharedFrame::new() })).collect();
+        Some((self.bbo_seq, time, bbos))
     }
 
     /// Clone of the shared active-variant registry, for handing to connections.
@@ -1231,7 +1247,8 @@ impl OrderBookListener {
                             .into_iter()
                             .map(|(coin, raw)| (coin, CoinBbo { raw, frame: SharedFrame::new() }))
                             .collect();
-                        let msg = Arc::new(InternalMessage::BboUpdate { bbos, time });
+                        self.bbo_seq += 1;
+                        let msg = Arc::new(InternalMessage::BboUpdate { bbos, time, seq: self.bbo_seq });
                         drop(tx.send(msg));
                         BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
                     }
@@ -1387,6 +1404,8 @@ pub(crate) enum InternalMessage {
     BboUpdate {
         bbos: HashMap<Coin, CoinBbo>,
         time: u64,
+        /// Increments by one per `BboUpdate`; see `OrderBookListener::current_bbos`.
+        seq: u64,
     },
     /// HFT L4 streaming - order diffs without waiting for status pairing,
     /// grouped per coin once (shared by l4Book and bookDiffs subscribers).
@@ -1797,9 +1816,44 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A ready listener (empty book) on a broadcast channel of `capacity`, with
+    /// a live bbo subscription counted so `BboUpdate`s are broadcast.
+    pub(crate) fn bbo_listener(
+        capacity: usize,
+    ) -> (OrderBookListener, tokio::sync::broadcast::Receiver<Arc<InternalMessage>>, Vec<ActiveSubGuard>) {
+        let (tx, rx) = tokio::sync::broadcast::channel(capacity);
+        let mut listener = OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true));
+        listener.init_from_snapshot(Snapshots::new(HashMap::new()), 0);
+        let guards = listener.active_subs().acquire_for(&Subscription::Bbo { coin: "BTC".to_string() });
+        (listener, rx, guards)
+    }
+
+    #[test]
+    fn test_current_bbos_carries_last_bbo_update_seq() {
+        let (mut listener, mut rx, _guards) = bbo_listener(64);
+        let btc: HashSet<Coin> = [Coin::new("BTC")].into();
+        assert_eq!(listener.current_bbos(&btc).unwrap().0, 0, "no BboUpdate sent yet");
+        for oid in 1..=3 {
+            feed_order(&mut listener, "BTC", oid, oid);
+        }
+        let mut last_seq = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if let InternalMessage::BboUpdate { seq, .. } = msg.as_ref() {
+                assert_eq!(*seq, last_seq + 1, "seq increments by one per BboUpdate");
+                last_seq = *seq;
+            }
+        }
+        assert!(last_seq > 0);
+        let (seq, _time, bbos) = listener.current_bbos(&btc).unwrap();
+        assert_eq!(seq, last_seq, "current_bbos reports the last broadcast seq");
+        let (bid, ask) = &bbos[&Coin::new("BTC")].raw;
+        assert_eq!(bid.as_ref().map(|(_, sz, n)| (sz.value(), *n)), Some((300_000_000, 3)));
+        assert!(ask.is_none());
+    }
 
     /// Build a ready listener (state initialized from an empty snapshot) with a held
     /// broadcast receiver so `receiver_count() > 0`.
@@ -2061,7 +2115,7 @@ mod tests {
     }
 
     /// Feed a paired status + New diff (both halves of an order add) at `height`.
-    fn feed_order(listener: &mut OrderBookListener, coin: &str, oid: u64, height: u64) {
+    pub(crate) fn feed_order(listener: &mut OrderBookListener, coin: &str, oid: u64, height: u64) {
         listener.apply_event_batch(
             height,
             EventBatch::Orders(make_status_batch(coin, oid, height)),
