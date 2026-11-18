@@ -729,25 +729,137 @@ pub(super) fn spawn_file_watcher(
     })
 }
 
-/// Start all 3 file watcher threads, returns receiver for events
+/// Block height a watcher event sorts by in the cross-stream merge. Lines
+/// without a parsable height and `Desync` markers sort first (0): they are
+/// still delivered in order within their own stream, and a desync should be
+/// acted on as soon as it is reached.
+fn event_height(event: &FileEvent) -> u64 {
+    match event {
+        FileEvent::OrderStatus(line)
+        | FileEvent::OrderDiff(line)
+        | FileEvent::Fill(line)
+        | FileEvent::BackfillOrderStatus(line)
+        | FileEvent::BackfillOrderDiff(line) => extract_block_number(line).unwrap_or(0),
+        FileEvent::Desync(_) => 0,
+    }
+}
+
+/// Number of watcher streams merged (statuses, diffs, fills).
+const N_STREAMS: usize = 3;
+
+/// The watcher streams, merged by block height.
+///
+/// Each source has its OWN bounded channel; `recv_many` hands out events in
+/// ascending block height across the streams (ties: statuses, then diffs,
+/// then fills), each stream's own order preserved.
+///
+/// Why: the three watchers used to share ONE bounded channel. When the
+/// consumer falls behind (heavy blocks: ~10k status + ~9k diff lines per
+/// block), every reader parks in `blocking_send` and the channel's FIFO-fair
+/// permits hand the readers EQUAL line rates. The statuses stream carries
+/// ~1.2x the lines per block (and ~3x the bytes) of the diffs stream, so the
+/// diffs reader runs blocks ahead of the statuses reader for the length of
+/// the burst. A new resting order needs BOTH halves (status + `new` diff):
+/// its level appears only when its status lands, i.e. while the book is
+/// already applying diffs of later blocks, and every message is stamped with
+/// that later block's time - new levels show up 1-7 blocks late, while
+/// removes/updates (diff-only) stay on time. The same reordering makes the
+/// late order's insertBefore anchor disappear first (removed by a later
+/// block's diff), hence the "insertBefore anchor missing" bursts.
+///
+/// The merge never waits for a stream that has nothing queued: with no
+/// backlog the behaviour is the old arrival order; under backlog every stream
+/// has queued lines and the merge is exact.
+pub(crate) struct MergedEvents {
+    rxs: [tokio::sync::mpsc::Receiver<FileEvent>; N_STREAMS],
+    heads: [Option<(u64, FileEvent)>; N_STREAMS],
+    closed: [bool; N_STREAMS],
+}
+
+impl MergedEvents {
+    fn new(rxs: [tokio::sync::mpsc::Receiver<FileEvent>; N_STREAMS]) -> Self {
+        Self { rxs, heads: [None, None, None], closed: [false; N_STREAMS] }
+    }
+
+    /// Top up every empty head from its channel without waiting.
+    fn fill_heads(&mut self) {
+        for i in 0..N_STREAMS {
+            if self.heads[i].is_none() && !self.closed[i] {
+                match self.rxs[i].try_recv() {
+                    Ok(event) => self.heads[i] = Some((event_height(&event), event)),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => self.closed[i] = true,
+                }
+            }
+        }
+    }
+
+    fn all_done(&self) -> bool {
+        self.closed.iter().all(|c| *c) && self.heads.iter().all(Option::is_none)
+    }
+
+    /// Like `mpsc::Receiver::recv_many`: waits until at least one event is
+    /// available, then appends up to `limit` events in merged order. Returns 0
+    /// only when every watcher has exited and nothing is left. Cancel-safe:
+    /// the only await is a `recv()` (itself cancel-safe) whose result is
+    /// stored in `heads` before anything else happens.
+    pub(crate) async fn recv_many(&mut self, buf: &mut Vec<FileEvent>, limit: usize) -> usize {
+        self.fill_heads();
+        while self.heads.iter().all(Option::is_none) {
+            if self.all_done() {
+                return 0;
+            }
+            let [r0, r1, r2] = &mut self.rxs;
+            let (c0, c1, c2) = (self.closed[0], self.closed[1], self.closed[2]);
+            let (i, got) = tokio::select! {
+                v = r0.recv(), if !c0 => (0, v),
+                v = r1.recv(), if !c1 => (1, v),
+                v = r2.recv(), if !c2 => (2, v),
+            };
+            match got {
+                Some(event) => self.heads[i] = Some((event_height(&event), event)),
+                None => self.closed[i] = true,
+            }
+            self.fill_heads();
+        }
+        let mut n = 0;
+        while n < limit {
+            let pick = (0..N_STREAMS).filter(|i| self.heads[*i].is_some()).min_by_key(|i| {
+                // (height, stream index): stream order breaks ties
+                (self.heads[*i].as_ref().map_or(u64::MAX, |(h, _)| *h), *i)
+            });
+            let Some(i) = pick else { break };
+            if let Some((_, event)) = self.heads[i].take() {
+                buf.push(event);
+                n += 1;
+            }
+            self.fill_heads();
+        }
+        n
+    }
+}
+
+/// Start all 3 file watcher threads, returns the height-merged receiver.
 /// Uses *_streaming directories (for --stream-with-block-info mode)
 /// `backfill_min_height` is the startup backfill floor (the node's persisted
 /// height at boot); 0 disables the backfill.
 ///
-/// The watcher threads send straight into a tokio mpsc via `blocking_send` -
+/// The watcher threads send straight into tokio mpscs via `blocking_send` -
 /// the old crossbeam channel + spawn_blocking bridge added a thread and a
 /// queue hop per event for nothing.
 pub(crate) fn start_parallel_file_watchers(
     data_dir: PathBuf,
     backfill_min_height: u64,
-) -> (tokio::sync::mpsc::Receiver<FileEvent>, Vec<thread::JoinHandle<()>>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>)
-{
+) -> (MergedEvents, Vec<thread::JoinHandle<()>>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
     // BOUNDED so a slow downstream actually back-pressures the file readers
     // (blocking_send parks until a slot frees up). Under processing stalls an
     // unbounded queue would accumulate multi-KB JSON strings indefinitely - a
     // primary OOM vector; the events sit on disk, no need to mirror them in
-    // memory.
-    let (tx, rx) = tokio::sync::mpsc::channel(10_000);
+    // memory. One channel PER SOURCE (see MergedEvents for why).
+    const PER_SOURCE_CAPACITY: usize = 10_000;
+    let (status_tx, status_rx) = tokio::sync::mpsc::channel(PER_SOURCE_CAPACITY);
+    let (diff_tx, diff_rx) = tokio::sync::mpsc::channel(PER_SOURCE_CAPACITY);
+    let (fill_tx, fill_rx) = tokio::sync::mpsc::channel(PER_SOURCE_CAPACITY);
     let mut handles = Vec::new();
 
     // Health monitoring
@@ -762,7 +874,7 @@ pub(crate) fn start_parallel_file_watchers(
     handles.push(spawn_file_watcher(
         EventSource::OrderStatuses,
         order_statuses_dir,
-        tx.clone(),
+        status_tx,
         last_order_status.clone(),
         backfill_min_height,
     ));
@@ -770,7 +882,7 @@ pub(crate) fn start_parallel_file_watchers(
     // Spawn watcher for Fills (no backfill: fills never mutate the book)
     let fills_dir = EventSource::Fills.event_source_dir_streaming(&data_dir);
     info!("Fills dir: {:?}", fills_dir);
-    handles.push(spawn_file_watcher(EventSource::Fills, fills_dir, tx.clone(), last_fills.clone(), 0));
+    handles.push(spawn_file_watcher(EventSource::Fills, fills_dir, fill_tx, last_fills.clone(), 0));
 
     // Spawn watcher for OrderDiffs
     let order_diffs_dir = EventSource::OrderDiffs.event_source_dir_streaming(&data_dir);
@@ -778,18 +890,88 @@ pub(crate) fn start_parallel_file_watchers(
     handles.push(spawn_file_watcher(
         EventSource::OrderDiffs,
         order_diffs_dir,
-        tx,
+        diff_tx,
         last_order_diffs.clone(),
         backfill_min_height,
     ));
 
-    (rx, handles, last_order_status, last_fills, last_order_diffs)
+    // Index order = tie-break order at equal heights: statuses, diffs, fills.
+    (MergedEvents::new([status_rx, diff_rx, fill_rx]), handles, last_order_status, last_fills, last_order_diffs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+
+    fn status_line(h: u64) -> FileEvent {
+        FileEvent::OrderStatus(format!(r#"{{"local_time":"t","block_time":"t","block_number":{h},"events":[]}}"#))
+    }
+    fn diff_line(h: u64) -> FileEvent {
+        FileEvent::OrderDiff(format!(r#"{{"local_time":"t","block_time":"t","block_number":{h},"events":[]}}"#))
+    }
+    fn tag(e: &FileEvent) -> (char, u64) {
+        match e {
+            FileEvent::OrderStatus(_) => ('s', event_height(e)),
+            FileEvent::OrderDiff(_) => ('d', event_height(e)),
+            FileEvent::Fill(_) => ('f', event_height(e)),
+            _ => ('x', event_height(e)),
+        }
+    }
+
+    /// The backlog case behind the late new levels: the diffs reader has run
+    /// blocks ahead (its channel holds 10..13) while the statuses channel still
+    /// holds 10..13 too. The merge must hand them out block by block, statuses
+    /// first, never a diff of block b+1 before the statuses of block b.
+    #[tokio::test]
+    async fn test_merge_orders_streams_by_height_under_backlog() {
+        let (stx, srx) = tokio::sync::mpsc::channel(64);
+        let (dtx, drx) = tokio::sync::mpsc::channel(64);
+        let (_ftx, frx) = tokio::sync::mpsc::channel(64);
+        for h in 10..14 {
+            dtx.send(diff_line(h)).await.unwrap();
+        }
+        for h in 10..14 {
+            stx.send(status_line(h)).await.unwrap();
+            stx.send(status_line(h)).await.unwrap();
+        }
+        let mut m = MergedEvents::new([srx, drx, frx]);
+        let mut buf = Vec::new();
+        let n = m.recv_many(&mut buf, 64).await;
+        assert_eq!(n, 12);
+        let got: Vec<(char, u64)> = buf.iter().map(tag).collect();
+        let want: Vec<(char, u64)> =
+            (10..14).flat_map(|h| [('s', h), ('s', h), ('d', h)]).collect();
+        assert_eq!(got, want);
+    }
+
+    /// With nothing queued on a stream the merge does not wait for it.
+    #[tokio::test]
+    async fn test_merge_does_not_wait_for_an_idle_stream() {
+        let (_stx, srx) = tokio::sync::mpsc::channel(8);
+        let (dtx, drx) = tokio::sync::mpsc::channel(8);
+        let (_ftx, frx) = tokio::sync::mpsc::channel(8);
+        dtx.send(diff_line(7)).await.unwrap();
+        let mut m = MergedEvents::new([srx, drx, frx]);
+        let mut buf = Vec::new();
+        assert_eq!(m.recv_many(&mut buf, 64).await, 1);
+        assert_eq!(tag(&buf[0]), ('d', 7));
+    }
+
+    /// recv_many returns 0 only once every sender is gone and nothing is left.
+    #[tokio::test]
+    async fn test_merge_ends_when_all_watchers_exit() {
+        let (stx, srx) = tokio::sync::mpsc::channel(8);
+        let (dtx, drx) = tokio::sync::mpsc::channel(8);
+        let (ftx, frx) = tokio::sync::mpsc::channel(8);
+        stx.send(status_line(1)).await.unwrap();
+        drop((stx, dtx, ftx));
+        let mut m = MergedEvents::new([srx, drx, frx]);
+        let mut buf = Vec::new();
+        assert_eq!(m.recv_many(&mut buf, 64).await, 1);
+        assert_eq!(m.recv_many(&mut buf, 64).await, 0);
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("obs_watcher_test_{}_{name}", std::process::id()));
