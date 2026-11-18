@@ -435,10 +435,12 @@ async fn merge_replay_paced_edge_cases() {
         Scenario { name: "statuses-stall-3s", status_stall: Some((mid, Duration::from_secs(3))), ..base.clone() },
         Scenario { name: "node-restart", restart: Some((mid, 100, Duration::from_secs(3))), ..base.clone() },
     ];
-    // Slack on top of the hold for the consumer's own batch processing.
-    let bound_ms = HOLD.as_millis() as u64 + env_u64("OBS_WAIT_SLACK_MS", 50);
+    // At most one hold per block, plus draining the lines that queued behind
+    // it (a block is ~2k lines) and the consumer's own batch processing: a
+    // diff never waits for statuses beyond this, however long they stall.
+    let bound_ms = 2 * HOLD.as_millis() as u64 + env_u64("OBS_WAIT_SLACK_MS", 50);
     let only = std::env::var("OBS_PACED_ONLY").ok();
-    for sc in scenarios.iter().filter(|s| only.as_deref().is_none_or(|o| o == s.name)) {
+    for sc in scenarios.iter().filter(|s| only.as_deref().is_none_or(|o| o.split(',').any(|n| n == s.name))) {
         for merged in [false, true] {
             let s = run(&dir, sc, merged).await;
             eprintln!("{} {}: {}", sc.name, if merged { "MERGED" } else { "shared" }, s.summary());
