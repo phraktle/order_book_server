@@ -132,12 +132,6 @@ struct Args {
     /// connection lags; see the README for sizing.
     #[arg(long, default_value_t = server::DEFAULT_BROADCAST_CAPACITY)]
     broadcast_capacity: usize,
-
-    /// Upper bound (ms, per block) a diff line waits for the order-statuses
-    /// stream to reach its block, so new orders are applied in their own
-    /// block. Never waits for an idle statuses stream. 0 disables the wait.
-    #[arg(long, default_value_t = server::DEFAULT_MERGE_HOLD_MS)]
-    merge_hold_ms: u64,
 }
 
 /// Start the Prometheus metrics HTTP server
@@ -203,7 +197,6 @@ async fn main() -> Result<()> {
         no_resync: args.no_resync,
         replay_cache_events: args.replay_cache_events,
         broadcast_capacity: args.broadcast_capacity,
-        merge_hold_ms: args.merge_hold_ms,
     };
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));

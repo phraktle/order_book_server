@@ -207,7 +207,7 @@ fn replay_recorded_streams_any_arrival_order_gives_the_nodes_book() {
             feed(&mut state, interleave(&upto(&diffs, d), &upto(&statuses, d), &orders[0].1));
             // the install starts with empty pairing caches
             state.pending_order_statuses.clear();
-            state.pending_new_diffs.clear();
+            state.awaiting_status.clear();
             feed(&mut state, interleave(&from(&diffs, c), &from(&statuses, c), key));
             let label = format!("re-sync overlap {back} blocks, then {label}");
             if !compare(&state, &want, &label) {

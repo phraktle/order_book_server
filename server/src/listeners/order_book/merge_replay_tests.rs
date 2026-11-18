@@ -27,7 +27,6 @@
 use super::parallel::{FileEvent, MergedEvents};
 use super::state::OrderBookState;
 use super::utils::EventBatch;
-use crate::order_book::Oid;
 use crate::order_book::multi_book::Snapshots;
 use crate::types::OrderDiff;
 use crate::types::node_data::EventSource;
@@ -39,7 +38,6 @@ use std::time::{Duration, Instant};
 
 const CAP: usize = 10_000; // = the production per-source / old shared capacity
 const BATCH: usize = 64; // = EVENT_RECV_BATCH
-const HOLD: Duration = Duration::from_millis(crate::DEFAULT_MERGE_HOLD_MS);
 
 fn height_of(line: &str) -> u64 {
     let Some(i) = line.find("\"block_number\":") else { return 0 };
@@ -83,6 +81,8 @@ struct Scenario {
     range: (u64, u64),
     /// Statuses written this much later than at the node (legit node lag).
     status_delay: Duration,
+    /// Diffs written this much later than at the node (statuses far ahead).
+    diff_delay: Duration,
     /// From this block on, the statuses stream is silent for this long.
     status_stall: Option<(u64, Duration)>,
     /// At this block both streams go down for `down`, then the last `rewind`
@@ -99,7 +99,10 @@ struct Stats {
     late_mods: BTreeMap<u64, usize>,
     /// Diff lines: write-to-apply wait, ms -> count (paced feeds only).
     diff_wait_ms: BTreeMap<u64, usize>,
-    holds_expired: u64,
+    /// Final book: oid -> (side, px, sz, queue index), and oid -> L4 metadata.
+    book: HashMap<u64, (u8, u64, u64, usize)>,
+    meta: HashMap<u64, String>,
+    awaiting: usize,
 }
 
 impl Stats {
@@ -125,7 +128,7 @@ impl Stats {
     }
     fn summary(&self) -> String {
         format!(
-            "lines s/d/f={:?} adds={} late_adds={} {:?} mods={} late_mods={} {:?} diff_wait_ms p50={} p99={} max={} holds_expired={}",
+            "lines s/d/f={:?} adds={} late_adds={} {:?} mods={} late_mods={} {:?} diff_wait_ms p50={} p99={} max={} resting={} awaiting_status={}",
             self.lines,
             self.adds,
             self.late_add_blocks(),
@@ -136,7 +139,8 @@ impl Stats {
             self.wait_pct(0.5),
             self.wait_pct(0.99),
             self.max_wait_ms(),
-            self.holds_expired
+            self.book.len(),
+            self.awaiting,
         )
     }
 }
@@ -209,6 +213,9 @@ fn producer(
                 if stream == 0 {
                     delay += sc.status_delay;
                 }
+                if stream == 1 {
+                    delay += sc.diff_delay;
+                }
                 let at = t0 + delay;
                 let now = Instant::now();
                 if at > now {
@@ -255,24 +262,14 @@ impl Consumer {
         let st = &mut self.st;
         match batch {
             EventBatch::Orders(batch) => {
-                let pending: usize =
-                    batch.events_ref().iter().filter(|s| state.pending_new_diffs_has(&Oid::new(s.order.oid))).count();
                 drop(state.apply_order_statuses_hft(batch));
-                let late = state.height().saturating_sub(b);
-                st.adds += pending;
-                if late > 0 && pending > 0 {
-                    *st.late_adds.entry(late).or_default() += pending;
-                }
             }
             EventBatch::BookDiffs(batch) => {
-                let kinds: Vec<(bool, bool)> = batch
+                let kinds: Vec<bool> = batch
                     .events_ref()
                     .iter()
                     .filter(|d| !d.coin().is_spot())
-                    .map(|d| match d.diff() {
-                        OrderDiff::New { .. } => (true, state.pending_order_statuses_has(&d.oid())),
-                        _ => (false, false),
-                    })
+                    .map(|d| matches!(d.diff(), OrderDiff::New { .. }))
                     .collect();
                 drop(state.apply_order_diffs_hft(batch));
                 if paced && let Some(t) = sent.lock().unwrap().remove(&b) {
@@ -283,20 +280,13 @@ impl Consumer {
                 // are scored.
                 if b >= self.seen_diff {
                     self.seen_diff = b;
+                    // the stamp every change of this batch is published with
                     let late = state.height().saturating_sub(b);
-                    for (is_new, paired) in kinds {
-                        if is_new {
-                            if paired {
-                                st.adds += 1;
-                                if late > 0 {
-                                    *st.late_adds.entry(late).or_default() += 1;
-                                }
-                            }
-                        } else {
-                            st.mods += 1;
-                            if late > 0 {
-                                *st.late_mods.entry(late).or_default() += 1;
-                            }
+                    for is_new in kinds {
+                        let (n, l) = if is_new { (&mut st.adds, &mut st.late_adds) } else { (&mut st.mods, &mut st.late_mods) };
+                        *n += 1;
+                        if late > 0 {
+                            *l.entry(late).or_default() += 1;
                         }
                     }
                 }
@@ -323,7 +313,6 @@ async fn run(dir: &Path, sc: &Scenario, merged: bool) -> Stats {
     let lt0 = if paced { first_local(dir, sc.range) } else { 0 };
     let sent: Sent = Arc::new(Mutex::new(HashMap::new()));
     let files = ["statuses.jsonl.zst", "diffs.jsonl.zst", "fills.jsonl.zst"];
-    let expired0 = crate::metrics::MERGE_HOLD_EXPIRED_TOTAL.get();
     // paced: give the readers time to skip to the range; backlog: let the channels fill
     let t0 = Instant::now() + Duration::from_secs(if paced { 3 } else { 0 });
     let mut c = Consumer::new();
@@ -342,7 +331,7 @@ async fn run(dir: &Path, sc: &Scenario, merged: bool) -> Stats {
             rxs.push(rx);
         }
         let Ok([srx, drx, frx]) = <[_; 3]>::try_from(rxs) else { unreachable!() };
-        let mut m = MergedEvents::new([srx, drx, frx], HOLD);
+        let mut m = MergedEvents::new([srx, drx, frx]);
         if !paced {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -375,7 +364,24 @@ async fn run(dir: &Path, sc: &Scenario, merged: bool) -> Stats {
         }
     }
     hs.into_iter().for_each(|h| h.join().unwrap());
-    c.st.holds_expired = crate::metrics::MERGE_HOLD_EXPIRED_TOTAL.get() - expired0;
+    for coin in c.state.compute_universe() {
+        let Some((_, _, snap)) = c.state.compute_snapshot_for_coin(&coin, crate::order_book::PxBand::default()) else {
+            continue;
+        };
+        for (side, orders) in snap.as_ref().iter().enumerate() {
+            for (q, o) in orders.iter().enumerate() {
+                c.st.book.insert(o.oid, (side as u8, o.limit_px.value(), o.sz.value(), q));
+                c.st.meta.insert(
+                    o.oid,
+                    format!(
+                        "{:?}|{:?}|{}|{:?}|{}|{}|{}|{}|{}",
+                        o.user, o.tif, o.order_type, o.cloid, o.trigger_condition, o.is_trigger, o.reduce_only, o.is_position_tpsl, o.timestamp
+                    ),
+                );
+            }
+        }
+    }
+    c.st.awaiting = c.state.awaiting_status_count();
     c.st
 }
 
@@ -397,17 +403,23 @@ async fn merge_replay_backlog() {
         feed: Feed::Backlog { consumer_bytes_per_ms: env_u64("OBS_REPLAY_BPMS", 150_000) },
         range: (env_u64("OBS_REPLAY_FROM", 0), env_u64("OBS_REPLAY_TO", u64::MAX)),
         status_delay: Duration::ZERO,
+        diff_delay: Duration::ZERO,
         status_stall: None,
         restart: None,
     };
+    let mut first: Option<Stats> = None;
     for merged in [false, true] {
         let t = Instant::now();
         let s = run(&dir, &sc, merged).await;
         eprintln!("{} {} ({:.0?}): {}", sc.name, if merged { "MERGED" } else { "shared" }, t.elapsed(), s.summary());
         assert!(s.adds > 0 && s.mods > 0, "the slice must exercise adds and updates/removes");
-        if merged {
-            assert_eq!(s.late_add_blocks(), 0, "merged: new levels added after their block");
-            assert_eq!(s.late_mod_blocks(), 0, "merged: updates/removes applied after their block");
+        // the book follows the diffs alone: nothing late, whichever channel layout
+        assert_eq!(s.late_add_blocks(), 0, "new levels added after their block");
+        assert_eq!(s.late_mod_blocks(), 0, "updates/removes applied after their block");
+        if let Some(f) = &first {
+            same_book_and_meta(f, &s, "backlog shared vs merged");
+        } else {
+            first = Some(s);
         }
     }
 }
@@ -426,6 +438,7 @@ async fn merge_replay_paced_edge_cases() {
         feed: Feed::Paced,
         range: (from, to),
         status_delay: Duration::ZERO,
+        diff_delay: Duration::ZERO,
         status_stall: None,
         restart: None,
     };
@@ -433,26 +446,42 @@ async fn merge_replay_paced_edge_cases() {
         base.clone(),
         Scenario { name: "statuses-lag-200ms", status_delay: Duration::from_millis(200), ..base.clone() },
         Scenario { name: "statuses-stall-3s", status_stall: Some((mid, Duration::from_secs(3))), ..base.clone() },
+        Scenario { name: "statuses-lag-5s", status_delay: Duration::from_secs(5), ..base.clone() },
+        Scenario { name: "statuses-stall-30s", status_stall: Some((mid, Duration::from_secs(30))), ..base.clone() },
+        Scenario { name: "statuses-ahead-500ms", diff_delay: Duration::from_millis(500), ..base.clone() },
         Scenario { name: "node-restart", restart: Some((mid, 100, Duration::from_secs(3))), ..base.clone() },
     ];
-    // At most one hold per block, plus draining the lines that queued behind
-    // it (a block is ~2k lines) and the consumer's own batch processing: a
-    // diff never waits for statuses beyond this, however long they stall.
-    let bound_ms = 2 * HOLD.as_millis() as u64 + env_u64("OBS_WAIT_SLACK_MS", 50);
+    let mut reference: Option<Stats> = None;
+    // Nothing waits across streams: a diff's write-to-apply time is the
+    // consumer's own processing only, whatever the statuses do.
+    let bound_ms = env_u64("OBS_WAIT_BOUND_MS", 50);
     let only = std::env::var("OBS_PACED_ONLY").ok();
     for sc in scenarios.iter().filter(|s| only.as_deref().is_none_or(|o| o.split(',').any(|n| n == s.name))) {
         for merged in [false, true] {
             let s = run(&dir, sc, merged).await;
             eprintln!("{} {}: {}", sc.name, if merged { "MERGED" } else { "shared" }, s.summary());
             assert!(s.lines[1] > 0);
-            if merged {
-                // never hold diffs beyond the bound, whatever the statuses do
-                assert!(s.max_wait_ms() <= bound_ms, "{}: a diff waited {} ms", sc.name, s.max_wait_ms());
-                if sc.name == "paced" {
-                    assert_eq!(s.late_add_blocks(), 0, "paced: new levels added after their block");
-                }
-                assert_eq!(s.late_mod_blocks(), 0, "{}: updates/removes after their block", sc.name);
+            assert!(s.max_wait_ms() <= bound_ms, "{}: a diff waited {} ms", sc.name, s.max_wait_ms());
+            assert_eq!(s.late_add_blocks(), 0, "{}: new levels added after their block", sc.name);
+            assert_eq!(s.late_mod_blocks(), 0, "{}: updates/removes after their block", sc.name);
+            // same book (levels, sizes, queue order) and same L4 metadata as the
+            // in-sync reference, however the statuses lagged, stalled or led
+            match &reference {
+                Some(r) => same_book_and_meta(r, &s, sc.name),
+                None => reference = Some(s),
             }
         }
     }
+}
+
+/// Book (side, px, sz, queue position) identical; L4 metadata identical for
+/// every order that has its status in both runs.
+fn same_book_and_meta(a: &Stats, b: &Stats, label: &str) {
+    assert!(!a.book.is_empty());
+    assert_eq!(a.book.len(), b.book.len(), "{label}: resting order count");
+    let diff_book = a.book.iter().filter(|(k, v)| b.book.get(*k) != Some(*v)).count();
+    assert_eq!(diff_book, 0, "{label}: {diff_book} orders differ in side/px/sz/queue");
+    let diff_meta = a.meta.iter().filter(|(k, v)| b.meta.get(*k) != Some(*v)).count();
+    eprintln!("{label}: book identical ({} orders); metadata differs on {diff_meta} (awaiting {} / {})", a.book.len(), a.awaiting, b.awaiting);
+    assert!(diff_meta <= a.awaiting.max(b.awaiting), "{label}: metadata differs beyond the orders still awaiting a status");
 }

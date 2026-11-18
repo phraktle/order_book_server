@@ -113,7 +113,7 @@ lazy_static! {
     /// Pending order diffs in HFT cache
     pub static ref PENDING_DIFFS_CACHE: IntGauge = IntGauge::new(
         "pending_diffs_cache_size",
-        "Pending order diffs in HFT cache"
+        "Resting orders still awaiting their status (L4 metadata only; the book does not wait)"
     ).expect("metric can be created");
 
     /// Broadcast channel lag (receivers behind)
@@ -166,9 +166,18 @@ lazy_static! {
         "New diffs whose insertBefore anchor was missing; order rested at back of level"
     ).expect("metric can be created");
 
-    pub static ref MERGE_HOLD_EXPIRED_TOTAL: IntCounter = IntCounter::new(
-        "merge_hold_expired_total",
-        "Diff blocks released by the watcher merge after waiting the full --merge-hold-ms for the statuses stream"
+    pub static ref DIFF_ANOMALY_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("diff_anomaly_total", "Book-diff events that should not happen with a consistent book (matched_on_insert, update/remove_unknown_oid, duplicate_new) and resting orders removed before their status attached (removed_before_status)"),
+        &["kind"]
+    ).expect("metric can be created");
+
+    pub static ref DIFF_TO_BBO_SECONDS: Histogram = Histogram::with_opts(
+        HistogramOpts::new("diff_to_bbo_seconds", "Node write time of a diff line (local_time) to its bbo broadcast")
+            .buckets(vec![0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0])
+    ).expect("metric can be created");
+
+    pub static ref STATUS_LAG_BLOCKS: IntGauge = IntGauge::new(
+        "status_lag_blocks", "Book (diff) height minus the highest statuses-stream height"
     ).expect("metric can be created");
 
     // ==================== FILE WATCHER METRICS ====================
@@ -316,7 +325,9 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(CHANNEL_DROPS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_DESYNCS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_FALLBACK_TOTAL.clone())).ok();
-    REGISTRY.register(Box::new(MERGE_HOLD_EXPIRED_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(DIFF_ANOMALY_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(DIFF_TO_BBO_SECONDS.clone())).ok();
+    REGISTRY.register(Box::new(STATUS_LAG_BLOCKS.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_HONORED_TOTAL.clone())).ok();
 
     // File watcher metrics

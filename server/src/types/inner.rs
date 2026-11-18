@@ -164,6 +164,30 @@ impl From<InnerL4Order> for L4Order {
     }
 }
 
+impl InnerL4Order {
+    /// A resting order from its New diff alone (everything the book needs);
+    /// the status attaches the remaining L4 metadata when it arrives.
+    pub(crate) fn from_new_diff(diff: &crate::types::node_data::NodeDataOrderDiff, block_time_ms: u64) -> Result<Self> {
+        Ok(Self {
+            user: diff.user,
+            coin: diff.coin(),
+            side: diff.side.ok_or_else(|| format!("new diff for oid {} has no side", diff.oid))?,
+            limit_px: Px::parse_from_str(&diff.px)?,
+            sz: Sz::new(0),
+            oid: diff.oid,
+            timestamp: block_time_ms,
+            trigger_condition: "N/A".to_string(),
+            is_trigger: false,
+            trigger_px: "0.0".to_string(),
+            is_position_tpsl: false,
+            reduce_only: false,
+            order_type: "Limit".to_string(),
+            tif: None,
+            cloid: None,
+        })
+    }
+}
+
 impl TryFrom<NodeDataOrderStatus> for InnerL4Order {
     type Error = Error;
 

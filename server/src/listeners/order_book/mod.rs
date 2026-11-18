@@ -1022,6 +1022,10 @@ impl OrderBookListener {
         }
         if self.fetched_snapshot_cache.is_some() {
             self.push_to_replay_cache(event_batch);
+        } else if matches!(event_batch, EventBatch::Orders(_)) {
+            // Statuses carry L4 metadata only, never book state: a late one is
+            // dropped (counted), never a reason to re-sync the book.
+            crate::metrics::PARSE_ERRORS_TOTAL.with_label_values(&["late_backfill_status"]).inc();
         } else {
             self.mark_desynced("late_backfill");
         }
@@ -1061,6 +1065,10 @@ impl OrderBookListener {
         }
 
         let process_start = Instant::now();
+        let diff_local_ms = match &event_batch {
+            EventBatch::BookDiffs(b) => Some(b.local_time_us()),
+            _ => None,
+        };
 
         if height % 100 == 0 {
             log::debug!("{event_source} block: {height}");
@@ -1186,7 +1194,8 @@ impl OrderBookListener {
                 ORDERBOOK_HEIGHT.set(state.height() as i64);
                 ORDERBOOK_TIME_MS.set(state.time() as i64);
                 PENDING_ORDERS_CACHE.set(state.pending_order_statuses_count() as i64);
-                PENDING_DIFFS_CACHE.set(state.pending_new_diffs_count() as i64);
+                PENDING_DIFFS_CACHE.set(state.awaiting_status_count() as i64);
+                crate::metrics::STATUS_LAG_BLOCKS.set(state.height() as i64 - state.status_height() as i64);
 
                 // Record orderbook stats
                 ORDERBOOK_ORDERS_TOTAL.set(state.order_count() as i64);
@@ -1205,7 +1214,7 @@ impl OrderBookListener {
                     sc,
                     state.height(),
                     state.pending_order_statuses_count(),
-                    state.pending_new_diffs_count()
+                    state.awaiting_status_count()
                 );
             }
         }
@@ -1239,6 +1248,11 @@ impl OrderBookListener {
                     }
                 }
             }
+        }
+        if let Some(lt) = diff_local_ms {
+            // node file write -> this diff line's bbo is out (same host clock)
+            let now = chrono::Utc::now().timestamp_micros();
+            crate::metrics::DIFF_TO_BBO_SECONDS.observe((now - lt).max(0) as f64 / 1e6);
         }
 
         // Throttled L2 snapshot broadcast for L2Book subscribers.
@@ -1610,7 +1624,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     // feed the watchdog in the periodic ticker below - a dead or wedged
     // watcher must not let the server keep serving a silently frozen book.
     let (mut tokio_rx, watcher_handles, last_order_statuses, _last_fills, last_order_diffs) =
-        parallel::start_parallel_file_watchers(dir, backfill_min_height, Duration::from_millis(config.merge_hold_ms));
+        parallel::start_parallel_file_watchers(dir, backfill_min_height);
 
     // Snapshot fetch channel
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
@@ -1956,6 +1970,7 @@ mod tests {
                 "oid": oid,
                 "px": "100.0",
                 "coin": coin,
+                "side": "B",
                 "raw_book_diff": raw_book_diff,
             }]
         }))
@@ -2408,11 +2423,17 @@ mod tests {
     #[test]
     fn test_late_backfill_with_no_cache_marks_desync() {
         let (mut listener, _rx) = ready_listener(); // cache already consumed by init
-        assert!(!listener.needs_resync());
         listener.cache_backfill_batch(EventBatch::Orders(make_status_batch("BTC", 1, 99)));
+        assert!(!listener.needs_resync(), "a late backfill STATUS is metadata only: dropped, no re-sync");
+        listener.cache_backfill_batch(EventBatch::BookDiffs(make_diff_batch(
+            "BTC",
+            1,
+            99,
+            serde_json::json!({"new": {"sz": "1.0", "insertBefore": null}}),
+        )));
         assert!(
             listener.needs_resync(),
-            "a backfill batch arriving after the replay cache is gone cannot be applied safely"
+            "a backfill DIFF batch arriving after the replay cache is gone cannot be applied safely"
         );
     }
 
