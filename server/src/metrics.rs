@@ -166,6 +166,11 @@ lazy_static! {
         "New diffs whose insertBefore anchor was missing; order rested at back of level"
     ).expect("metric can be created");
 
+    pub static ref MERGE_HOLD_EXPIRED_TOTAL: IntCounter = IntCounter::new(
+        "merge_hold_expired_total",
+        "Diff blocks released by the watcher merge after waiting the full --merge-hold-ms for the statuses stream"
+    ).expect("metric can be created");
+
     // ==================== FILE WATCHER METRICS ====================
 
     /// File events received per source (orders, diffs, fills)
@@ -311,6 +316,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(CHANNEL_DROPS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_DESYNCS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_FALLBACK_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(MERGE_HOLD_EXPIRED_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_HONORED_TOTAL.clone())).ok();
 
     // File watcher metrics

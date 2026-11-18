@@ -82,6 +82,10 @@ pub struct ServerConfig {
     /// the overflow (`channel_drops_total`). 0 = keep the built-in default
     /// ([`DEFAULT_BROADCAST_CAPACITY`]).
     pub broadcast_capacity: usize,
+    /// Upper bound (ms, per block) on how long a diff line waits for the
+    /// statuses stream to reach its block in the watcher merge. 0 = never
+    /// wait (pure height merge of what is queued).
+    pub merge_hold_ms: u64,
 }
 
 /// Default broadcast channel capacity, sized from mainnet traffic (perps,
@@ -96,3 +100,10 @@ pub struct ServerConfig {
 /// with L4) are only held while some connection is behind, so a full channel
 /// costs ~1.8-2.7 GB at worst.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 1 << 20;
+
+/// Default `--merge-hold-ms`: bound on how long a diff line waits for the
+/// order-statuses stream to reach its block in the listener's watcher merge.
+/// The node writes both streams within a few ms of each other (measured
+/// 2026-11-18: per-block last write 0 ms median, 32 ms max), so 50 ms covers
+/// its jitter while capping the added latency.
+pub const DEFAULT_MERGE_HOLD_MS: u64 = 50;
