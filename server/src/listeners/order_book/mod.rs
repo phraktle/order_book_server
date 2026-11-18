@@ -60,6 +60,8 @@ const MAX_CACHED_EVENTS: usize = 4_000_000;
 mod parallel;
 mod state;
 mod utils;
+#[cfg(test)]
+mod merge_replay_tests;
 
 fn fetch_snapshot(
     snapshot_config: SnapshotConfig,
@@ -1608,7 +1610,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     // feed the watchdog in the periodic ticker below - a dead or wedged
     // watcher must not let the server keep serving a silently frozen book.
     let (mut tokio_rx, watcher_handles, last_order_statuses, _last_fills, last_order_diffs) =
-        parallel::start_parallel_file_watchers(dir, backfill_min_height);
+        parallel::start_parallel_file_watchers(dir, backfill_min_height, Duration::from_millis(config.merge_hold_ms));
 
     // Snapshot fetch channel
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
