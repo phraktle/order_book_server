@@ -64,6 +64,17 @@ impl<O: InnerOrder> PriceLevel<O> {
 
     /// Change an order's size in place, applying the delta to the aggregate.
     /// Updates can increase as well as decrease the size.
+    /// Replace a resting order's value in place, keeping its size and queue
+    /// position (the aggregate is untouched: the size is carried over).
+    pub(crate) fn replace_meta(&mut self, oid: &Oid, mut meta: O) -> bool {
+        let Some(order) = self.orders.node_value_mut(oid) else {
+            return false;
+        };
+        meta.modify_sz(order.sz());
+        *order = meta;
+        true
+    }
+
     pub(crate) fn modify_order_sz(&mut self, oid: &Oid, sz: Sz) -> bool {
         let Some(order) = self.orders.node_value_mut(oid) else {
             return false;

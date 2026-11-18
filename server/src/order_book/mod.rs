@@ -122,6 +122,11 @@ impl<O: InnerOrder> OrderBook<O> {
             Side::Bid => (&mut self.asks, &mut self.bids),
         };
         let oids = match_order(maker_orders, &mut order);
+        if !oids.is_empty() {
+            // With diffs applied in node order the book never crosses: a match
+            // here means the book diverged somewhere.
+            crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["matched_on_insert"]).inc();
+        }
         for oid in oids {
             self.oid_to_side_px.remove(&oid);
         }
@@ -147,6 +152,25 @@ impl<O: InnerOrder> OrderBook<O> {
             }
         }
         false
+    }
+
+    pub(crate) fn contains(&self, oid: &Oid) -> bool {
+        self.oid_to_side_px.contains_key(oid)
+    }
+
+    /// Attach late metadata to a resting order (same side and price only).
+    pub(crate) fn replace_meta(&mut self, meta: O) -> bool {
+        let oid = meta.oid();
+        let Some((side, px)) = self.oid_to_side_px.get(&oid) else { return false };
+        if *side != meta.side() || *px != meta.limit_px() {
+            log::warn!("status for oid={oid:?} disagrees with its resting diff (side/px); metadata not attached");
+            return false;
+        }
+        let map = match side {
+            Side::Ask => &mut self.asks,
+            Side::Bid => &mut self.bids,
+        };
+        map.get_mut(px).is_some_and(|level| level.replace_meta(&oid, meta))
     }
 
     pub(crate) fn modify_sz(&mut self, oid: Oid, sz: Sz) -> bool {
