@@ -60,6 +60,8 @@ const MAX_CACHED_EVENTS: usize = 4_000_000;
 mod parallel;
 mod state;
 mod utils;
+#[cfg(test)]
+mod stream_replay_tests;
 
 fn fetch_snapshot(
     snapshot_config: SnapshotConfig,
@@ -1020,6 +1022,10 @@ impl OrderBookListener {
         }
         if self.fetched_snapshot_cache.is_some() {
             self.push_to_replay_cache(event_batch);
+        } else if matches!(event_batch, EventBatch::Orders(_)) {
+            // Statuses carry L4 metadata only, never book state: a late one is
+            // dropped (counted), never a reason to re-sync the book.
+            crate::metrics::STATUS_DROPPED_TOTAL.with_label_values(&["late_backfill"]).inc();
         } else {
             self.mark_desynced("late_backfill");
         }
@@ -1184,7 +1190,7 @@ impl OrderBookListener {
                 ORDERBOOK_HEIGHT.set(state.height() as i64);
                 ORDERBOOK_TIME_MS.set(state.time() as i64);
                 PENDING_ORDERS_CACHE.set(state.pending_order_statuses_count() as i64);
-                PENDING_DIFFS_CACHE.set(state.pending_new_diffs_count() as i64);
+                PENDING_DIFFS_CACHE.set(state.awaiting_status_count() as i64);
 
                 // Record orderbook stats
                 ORDERBOOK_ORDERS_TOTAL.set(state.order_count() as i64);
@@ -1203,7 +1209,7 @@ impl OrderBookListener {
                     sc,
                     state.height(),
                     state.pending_order_statuses_count(),
-                    state.pending_new_diffs_count()
+                    state.awaiting_status_count()
                 );
             }
         }
@@ -1954,6 +1960,7 @@ mod tests {
                 "oid": oid,
                 "px": "100.0",
                 "coin": coin,
+                "side": "B",
                 "raw_book_diff": raw_book_diff,
             }]
         }))
@@ -2406,11 +2413,17 @@ mod tests {
     #[test]
     fn test_late_backfill_with_no_cache_marks_desync() {
         let (mut listener, _rx) = ready_listener(); // cache already consumed by init
-        assert!(!listener.needs_resync());
         listener.cache_backfill_batch(EventBatch::Orders(make_status_batch("BTC", 1, 99)));
+        assert!(!listener.needs_resync(), "a late backfill STATUS is metadata only: dropped, no re-sync");
+        listener.cache_backfill_batch(EventBatch::BookDiffs(make_diff_batch(
+            "BTC",
+            1,
+            99,
+            serde_json::json!({"new": {"sz": "1.0", "insertBefore": null}}),
+        )));
         assert!(
             listener.needs_resync(),
-            "a backfill batch arriving after the replay cache is gone cannot be applied safely"
+            "a backfill DIFF batch arriving after the replay cache is gone cannot be applied safely"
         );
     }
 

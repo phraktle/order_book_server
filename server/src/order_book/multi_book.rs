@@ -69,6 +69,14 @@ impl<O: InnerOrder> OrderBooks<O> {
         self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order_before(order, insert_before)
     }
 
+    pub(crate) fn contains(&self, coin: &Coin, oid: &Oid) -> bool {
+        self.order_books.get(coin).is_some_and(|book| book.contains(oid))
+    }
+
+    pub(crate) fn replace_order_meta(&mut self, meta: O) -> bool {
+        self.order_books.get_mut(&meta.coin()).is_some_and(|book| book.replace_meta(meta))
+    }
+
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
         if let Some(book) = self.order_books.get_mut(&coin) {
             let success = book.cancel_order(oid.clone());
