@@ -1075,6 +1075,18 @@ impl OrderBookListener {
             return;
         };
 
+        // A diff line below the book's height means the node rewrote blocks the
+        // book already applied (node restart). Re-applying them is not
+        // idempotent (an oid re-used inside the rewound window can end with a
+        // stale size or queue position), so let a fresh snapshot replace the
+        // book: mark once, the install clears it.
+        if matches!(event_batch, EventBatch::BookDiffs(_))
+            && !self.needs_resync
+            && self.order_book_state.as_ref().is_some_and(|state| height < state.height())
+        {
+            self.mark_desynced("diff_below_book_height");
+        }
+
         // Collected here and applied after the state borrow ends.
         let mut desync_reason: Option<&'static str> = None;
 
@@ -2407,6 +2419,18 @@ mod tests {
         let (pending, cache_alive) = guard.replay_cache_status();
         assert_eq!(pending, 0, "the abandoned cache must be empty");
         assert!(!cache_alive, "the abandoned cache must be gone, not just drained");
+    }
+
+    #[test]
+    fn test_diff_below_book_height_marks_desync_once() {
+        let (mut listener, _rx) = ready_listener();
+        let new = || serde_json::json!({"new": {"sz": "1.0", "insertBefore": null}});
+        let h = listener.order_book_state.as_ref().unwrap().height() + 10;
+        listener.apply_event_batch(h, EventBatch::BookDiffs(make_diff_batch("BTC", 1, h, new())), EventSource::OrderDiffs);
+        listener.apply_event_batch(h, EventBatch::BookDiffs(make_diff_batch("BTC", 2, h, new())), EventSource::OrderDiffs);
+        assert!(!listener.needs_resync(), "same height: normal");
+        listener.apply_event_batch(h - 5, EventBatch::BookDiffs(make_diff_batch("BTC", 3, h - 5, new())), EventSource::OrderDiffs);
+        assert!(listener.needs_resync(), "a diff below the book height is a node rewrite: re-sync");
     }
 
     #[test]
