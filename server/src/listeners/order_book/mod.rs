@@ -1065,6 +1065,10 @@ impl OrderBookListener {
         }
 
         let process_start = Instant::now();
+        let diff_written_us = match &event_batch {
+            EventBatch::BookDiffs(b) => Some(b.local_time_us()),
+            _ => None,
+        };
 
         if height % 100 == 0 {
             log::debug!("{event_source} block: {height}");
@@ -1191,6 +1195,7 @@ impl OrderBookListener {
                 ORDERBOOK_TIME_MS.set(state.time() as i64);
                 PENDING_ORDERS_CACHE.set(state.pending_order_statuses_count() as i64);
                 PENDING_DIFFS_CACHE.set(state.awaiting_status_count() as i64);
+                crate::metrics::STATUS_LAG_BLOCKS.set(state.height() as i64 - state.status_height() as i64);
 
                 // Record orderbook stats
                 ORDERBOOK_ORDERS_TOTAL.set(state.order_count() as i64);
@@ -1243,6 +1248,12 @@ impl OrderBookListener {
                     }
                 }
             }
+        }
+
+        if let Some(written) = diff_written_us {
+            // node file write (local_time, same host clock) -> applied + bbo sent
+            let now = chrono::Utc::now().timestamp_micros();
+            crate::metrics::DIFF_TO_BBO_SECONDS.observe((now - written).max(0) as f64 / 1e6);
         }
 
         // Throttled L2 snapshot broadcast for L2Book subscribers.

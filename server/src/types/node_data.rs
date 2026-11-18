@@ -129,6 +129,10 @@ impl<E> Batch<E> {
         self.local_time.and_utc().timestamp_millis()
     }
 
+    pub(crate) fn local_time_us(&self) -> i64 {
+        self.local_time.and_utc().timestamp_micros()
+    }
+
 }
 
 #[cfg(test)]

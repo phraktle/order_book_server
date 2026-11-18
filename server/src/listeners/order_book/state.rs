@@ -19,6 +19,8 @@ pub(super) struct OrderBookState {
     order_book: OrderBooks<InnerL4Order>,
     height: u64,
     time: u64,
+    /// Highest block seen on the statuses stream (diagnostics only).
+    status_height: u64,
     ignore_spot: bool,
     // Statuses that arrived before their order's New diff: the L4 metadata to
     // attach when the diff rests the order. Never needed for the book itself.
@@ -102,6 +104,7 @@ impl OrderBookState {
             ignore_spot,
             time,
             height,
+            status_height: height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             pending_order_statuses: rustc_hash::FxHashMap::default(),
             awaiting_status: rustc_hash::FxHashMap::default(),
@@ -184,6 +187,10 @@ impl OrderBookState {
     }
 
     /// Count of OrderDiff::New sizes waiting for their OrderStatus to arrive  
+    pub(super) const fn status_height(&self) -> u64 {
+        self.status_height
+    }
+
     pub(super) fn awaiting_status_count(&self) -> usize {
         self.awaiting_status.len()
     }
@@ -305,6 +312,7 @@ impl OrderBookState {
     /// lagging statuses stream never delays or re-stamps a book change.
     /// Returns the coins whose BOOK changed - always none here.
     pub(super) fn apply_order_statuses_hft(&mut self, batch: Batch<NodeDataOrderStatus>) -> Result<HashSet<Coin>> {
+        self.status_height = self.status_height.max(batch.block_number());
         for order_status in batch.events() {
             let oid = Oid::new(order_status.order.oid);
 
