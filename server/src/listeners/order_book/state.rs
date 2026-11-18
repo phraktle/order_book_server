@@ -32,6 +32,9 @@ pub(super) struct OrderBookState {
     // reduce-only, ...). The book itself never waits: a New diff carries
     // user/coin/side/px/sz/oid/queue position, everything the L2/bbo needs.
     awaiting_status: rustc_hash::FxHashMap<Oid, (Coin, Instant)>,
+    // Orders an Update to size 0 took off the book: the node follows such an
+    // update with a Remove for the same oid, which then has nothing to remove.
+    zeroed_by_update: rustc_hash::FxHashSet<Oid>,
     // insertBefore anchors that were missing from the book (add fell back to the back of
     // the level). Drained per batch by the listener, which converts a nonzero count into
     // a desync mark + Prometheus counter. Sticky across snapshot replay on purpose.
@@ -105,6 +108,7 @@ impl OrderBookState {
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             pending_order_statuses: rustc_hash::FxHashMap::default(),
             awaiting_status: rustc_hash::FxHashMap::default(),
+            zeroed_by_update: rustc_hash::FxHashSet::default(),
             insert_before_fallbacks: 0,
             untriggered_orders,
             track_untriggered,
@@ -487,8 +491,13 @@ impl OrderBookState {
                     if new_sz.value() == 0 && self.awaiting_status.remove(&oid).is_some() {
                         crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["removed_before_status"]).inc();
                     }
-                    if !self.order_book.modify_sz(oid, coin.clone(), new_sz) {
+                    if !self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
                         crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["update_unknown_oid"]).inc();
+                    } else if new_sz.value() == 0 {
+                        if self.zeroed_by_update.len() > 1_000_000 {
+                            self.zeroed_by_update.clear(); // backstop; only relabels a later Remove
+                        }
+                        self.zeroed_by_update.insert(oid);
                     }
                     changed_coins.insert(coin);
                 }
@@ -496,8 +505,15 @@ impl OrderBookState {
                     if self.awaiting_status.remove(&oid).is_some() {
                         crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["removed_before_status"]).inc();
                     }
+                    let zeroed = self.zeroed_by_update.remove(&oid);
                     if !self.order_book.cancel_order(oid, coin.clone()) {
-                        crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["remove_unknown_oid"]).inc();
+                        // after an Update to 0 the Remove is expected to find nothing
+                        let kind = if zeroed { "remove_after_zero_update" } else { "remove_unknown_oid" };
+                        crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&[kind]).inc();
+                        static SAMPLED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if !zeroed && SAMPLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                            log::warn!("remove_unknown_oid sample: oid={} coin={} h={height}", diff.oid, diff.coin().value());
+                        }
                     }
                     changed_coins.insert(coin);
                 }
