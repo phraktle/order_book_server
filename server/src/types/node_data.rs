@@ -11,10 +11,14 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NodeDataOrderDiff {
-    user: Address,
-    oid: u64,
-    px: String,
+    pub(crate) user: Address,
+    pub(crate) oid: u64,
+    pub(crate) px: String,
     coin: String,
+    // Not part of the bookDiffs wire format (skipped when serializing); the
+    // book needs it to rest an order from its diff alone.
+    #[serde(default, skip_serializing)]
+    pub(crate) side: Option<crate::order_book::types::Side>,
     pub(crate) raw_book_diff: OrderDiff,
 }
 

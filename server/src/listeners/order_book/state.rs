@@ -20,16 +20,19 @@ pub(super) struct OrderBookState {
     height: u64,
     time: u64,
     ignore_spot: bool,
-    // Persistent cache of OrderStatuses waiting for their New diffs
-    // Allows OrderStatus and OrderDiff to arrive in any order (HFT-compatible).
+    // Statuses that arrived before their order's New diff: the L4 metadata to
+    // attach when the diff rests the order. Never needed for the book itself.
     // Entries carry their insertion time so cleanup can evict by age instead of
     // nuking the whole map (which killed in-flight halves and forced re-syncs).
     pending_order_statuses: rustc_hash::FxHashMap<Oid, (NodeDataOrderStatus, Instant)>,
-    // Persistent cache of New diffs (sz + optional insertBefore anchor) waiting for their
-    // OrderStatuses. This is the other half of bidirectional caching - handles when Diff
-    // arrives BEFORE Status. The anchor must survive the cache so a late-pairing priority
-    // ALO order still splices into the right queue position.
-    pending_new_diffs: rustc_hash::FxHashMap<Oid, (crate::order_book::types::Sz, Option<Oid>, Instant)>,
+    // Orders resting on the book from their New diff alone, still waiting for
+    // their status to attach the L4 metadata (cloid, tif, trigger fields,
+    // reduce-only, ...). The book itself never waits: a New diff carries
+    // user/coin/side/px/sz/oid/queue position, everything the L2/bbo needs.
+    awaiting_status: rustc_hash::FxHashMap<Oid, (Coin, Instant)>,
+    // Orders an Update to size 0 took off the book: the node follows such an
+    // update with a Remove for the same oid, which then has nothing to remove.
+    zeroed_by_update: rustc_hash::FxHashSet<Oid>,
     // insertBefore anchors that were missing from the book (add fell back to the back of
     // the level). Drained per batch by the listener, which converts a nonzero count into
     // a desync mark + Prometheus counter. Sticky across snapshot replay on purpose.
@@ -101,7 +104,8 @@ impl OrderBookState {
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
             pending_order_statuses: rustc_hash::FxHashMap::default(),
-            pending_new_diffs: rustc_hash::FxHashMap::default(),
+            awaiting_status: rustc_hash::FxHashMap::default(),
+            zeroed_by_update: rustc_hash::FxHashSet::default(),
             insert_before_fallbacks: 0,
             untriggered_orders,
             track_untriggered,
@@ -180,8 +184,8 @@ impl OrderBookState {
     }
 
     /// Count of OrderDiff::New sizes waiting for their OrderStatus to arrive  
-    pub(super) fn pending_new_diffs_count(&self) -> usize {
-        self.pending_new_diffs.len()
+    pub(super) fn awaiting_status_count(&self) -> usize {
+        self.awaiting_status.len()
     }
 
     /// Total number of orders currently in the orderbook
@@ -232,65 +236,40 @@ impl OrderBookState {
 
     /// Cleanup stale pending entries to prevent unbounded memory growth.
     ///
-    /// Primary mechanism is AGE-based eviction: a half that has waited longer
-    /// than `PENDING_MAX_AGE` will never pair (the two streams skew by
-    /// milliseconds, not minutes). The old size-only force-clear nuked
-    /// genuinely in-flight young halves whenever a burst pushed the map over
-    /// the cap, forcing an avoidable 10-30s snapshot re-sync.
+    /// Both caches hold L4 metadata only - the book never depends on them - so
+    /// evicting them is never book data loss:
+    /// - an aged-out `pending_order_statuses` entry is an expected orphan (its
+    ///   order never rested, or was removed before the status came);
+    /// - `awaiting_status` is never aged (a status lagging minutes must still
+    ///   attach); only a size backstop applies.
     ///
-    /// Loss semantics differ per cache:
-    /// - Aged-out `pending_order_statuses` are expected orphans (statuses with
-    ///   `is_inserted_into_book() == true` whose order never rested, so no New
-    ///   diff ever comes) - evicted silently, NOT data loss.
-    /// - An aged-out `pending_new_diffs` entry means a New diff never got its
-    ///   status: the book is missing that order, which IS data loss.
+    /// The size cap is an OOM backstop (fresh map so the bucket capacity is
+    /// released). Also compacts the orderbook slab allocators on the same
+    /// cadence.
     ///
-    /// The size caps remain as an OOM backstop; hitting one still force-clears
-    /// (fresh `HashMap::new()` so the high-water-mark bucket capacity is
-    /// actually released) and counts as data loss.
-    /// Also opportunistically compacts the orderbook slab allocators on the same
-    /// cadence, since both are unbounded-growth vectors that the maintenance tick
-    /// is responsible for bounding.
-    ///
-    /// Returns `true` when potentially-live data was evicted; the caller must
-    /// treat this as data loss and mark the book for re-sync.
+    /// Returns `true` when book data was lost (never, here; kept for the
+    /// caller's contract).
     pub(super) fn cleanup_stale_pending(&mut self) -> bool {
-        const MAX_PENDING_ORDERS: usize = 50_000;
-        const MAX_PENDING_DIFFS: usize = 10_000;
+        const MAX_PENDING_ORDERS: usize = 200_000;
+        const MAX_AWAITING: usize = 2_000_000;
         const PENDING_MAX_AGE: Duration = Duration::from_secs(60);
-
-        let mut cleared = false;
 
         let before = self.pending_order_statuses.len();
         self.pending_order_statuses.retain(|_, (_, at)| at.elapsed() < PENDING_MAX_AGE);
         let aged_statuses = before - self.pending_order_statuses.len();
         if aged_statuses > 0 {
-            // Expected orphans (order never rested -> no New diff): not data loss.
             log::info!("Evicted {aged_statuses} aged pending_order_statuses entries (no matching BookDiff)");
         }
-
-        let before = self.pending_new_diffs.len();
-        self.pending_new_diffs.retain(|_, (_, _, at)| at.elapsed() < PENDING_MAX_AGE);
-        let aged_diffs = before - self.pending_new_diffs.len();
-        if aged_diffs > 0 {
-            // A New diff with no status in 60s: the order is missing from the book.
-            log::warn!("Evicted {aged_diffs} aged pending_new_diffs entries (status never arrived - data loss)");
-            cleared = true;
-        }
-
         if self.pending_order_statuses.len() > MAX_PENDING_ORDERS {
-            log::warn!(
-                "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs)",
-                self.pending_order_statuses.len()
-            );
+            log::warn!("Clearing pending_order_statuses cache: {} entries", self.pending_order_statuses.len());
             self.pending_order_statuses = rustc_hash::FxHashMap::default();
-            cleared = true;
         }
-
-        if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
-            log::warn!("Clearing stale pending_new_diffs cache: {} entries", self.pending_new_diffs.len());
-            self.pending_new_diffs = rustc_hash::FxHashMap::default();
-            cleared = true;
+        // awaiting_status is bounded by the resting orders (entries leave on
+        // Remove / Update to 0, or when their status attaches): never aged out,
+        // so a status lagging minutes (cold start, backlog) still attaches.
+        if self.awaiting_status.len() > MAX_AWAITING {
+            log::warn!("Clearing awaiting_status cache: {} entries", self.awaiting_status.len());
+            self.awaiting_status = rustc_hash::FxHashMap::default();
         }
 
         let compacted = self.order_book.compact_all();
@@ -298,7 +277,7 @@ impl OrderBookState {
             let (live, cap) = self.order_book.slab_stats();
             log::info!("Compacted {compacted} price-level slabs (live={live}, capacity={cap})");
         }
-        cleared
+        false
     }
 
     /// Get BBO for specific coins only - even faster for selective broadcast
@@ -320,20 +299,12 @@ impl OrderBookState {
         (self.time, bbos)
     }
 
-    /// HFT-specific: Process OrderStatuses independently without block synchronization
-    /// Uses bidirectional caching - if diff already arrived, add order immediately
-    /// Returns the set of coins that were modified (for selective BBO broadcast)
+    /// Order statuses carry L4 metadata only: they never change the price-level
+    /// book (its contents and its height/time come from the diff stream alone),
+    /// so the two streams are processed as they arrive, in any order, and a
+    /// lagging statuses stream never delays or re-stamps a book change.
+    /// Returns the coins whose BOOK changed - always none here.
     pub(super) fn apply_order_statuses_hft(&mut self, batch: Batch<NodeDataOrderStatus>) -> Result<HashSet<Coin>> {
-        let height = batch.block_number();
-        let time = batch.block_time();
-        let mut changed_coins = HashSet::new();
-
-        // Update height/time to track progress (>= ensures time updates even at same height)
-        if height >= self.height {
-            self.height = height;
-            self.time = time;
-        }
-
         for order_status in batch.events() {
             let oid = Oid::new(order_status.order.oid);
 
@@ -377,29 +348,35 @@ impl OrderBookState {
                 }
             }
 
-            // Check if there's a pending New diff for this order
-            if let Some((sz, insert_before, _)) = self.pending_new_diffs.remove(&oid) {
-                // Both arrived - add order immediately!
+            if !order_status.is_inserted_into_book() {
+                // Only a resting status ("open" non-IOC non-trigger, or
+                // "triggered") describes a resting order. Any other status
+                // (canceled / filled / an earlier "open" of a trigger order /
+                // ...) never attaches; a terminal one ends a wait for the oid.
+                self.pending_order_statuses.remove(&oid);
+            } else if self.awaiting_status.contains_key(&oid) {
+                // The order already rests (from its diff): attach the metadata.
                 let time = order_status.time.and_utc().timestamp_millis();
-                let order_coin = Coin::new(&order_status.order.coin);
-                let mut inner_order: InnerL4Order = order_status.try_into()?;
-                inner_order.modify_sz(sz);
-                inner_order.convert_trigger(time.max(0) as u64);
-                let px = inner_order.limit_px();
-                let anchor = insert_before.clone();
-                if self.order_book.add_order_before(inner_order, insert_before) {
-                    self.note_insert_before_fallback(&oid, &order_coin, anchor.as_ref(), px);
-                } else if anchor.is_some() {
-                    crate::metrics::INSERT_BEFORE_HONORED_TOTAL.inc();
+                match InnerL4Order::try_from(order_status) {
+                    Ok(mut meta) => {
+                        meta.convert_trigger(time.max(0) as u64);
+                        if self.order_book.replace_order_meta(meta) {
+                            self.awaiting_status.remove(&oid);
+                        }
+                    }
+                    Err(err) => {
+                        // Metadata only: skip the event, never the batch, never a re-sync.
+                        crate::metrics::PARSE_ERRORS_TOTAL.with_label_values(&["status_meta"]).inc();
+                        log::warn!("Unparseable status for resting oid={oid:?}: {err}");
+                    }
                 }
-                changed_coins.insert(order_coin.clone());
-                log::debug!("Order added (status arrived after diff): oid={:?} coin={:?}", oid, order_coin);
-            } else if order_status.is_inserted_into_book() {
-                // Diff hasn't arrived yet - cache the OrderStatus
+            } else {
+                // Diff not here yet (or the order never rests): keep the metadata
+                // for the diff to pick up; orphans age out.
                 self.pending_order_statuses.insert(oid, (order_status, Instant::now()));
             }
         }
-        Ok(changed_coins)
+        Ok(HashSet::new())
     }
 
     #[cfg(test)]
@@ -415,25 +392,27 @@ impl OrderBookState {
         for (_, at) in self.pending_order_statuses.values_mut() {
             *at = backdated;
         }
-        for (_, _, at) in self.pending_new_diffs.values_mut() {
+        for (_, at) in self.awaiting_status.values_mut() {
             *at = backdated;
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn pending_new_diffs_has(&self, oid: &Oid) -> bool {
-        self.pending_new_diffs.contains_key(oid)
+    pub(crate) fn awaiting_status_has(&self, oid: &Oid) -> bool {
+        self.awaiting_status.contains_key(oid)
     }
 
-    /// HFT-specific: Process OrderDiffs independently without block synchronization
-    /// Uses bidirectional caching - if status already arrived, add order immediately
-    /// Returns the set of coins that were modified (for selective BBO broadcast)
+    /// The book follows the diff stream alone: a New diff rests its order
+    /// immediately (stamped with the diff's own block), with the L4 metadata of
+    /// its status when that already arrived, else with what the diff carries
+    /// (user/coin/side/px/sz/oid) until the status attaches the rest.
+    /// Returns the set of coins that were modified (for selective BBO broadcast).
     pub(super) fn apply_order_diffs_hft(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<HashSet<Coin>> {
         let height = batch.block_number();
         let time = batch.block_time();
         let mut changed_coins = HashSet::new();
 
-        // Update height/time to track progress (>= ensures time updates even at same height)
+        // The book's height/time = the diff stream's (>= keeps time current at the same height)
         if height >= self.height {
             self.height = height;
             self.time = time;
@@ -448,35 +427,82 @@ impl OrderBookState {
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
                 InnerOrderDiff::New { sz, insert_before } => {
-                    // Check if OrderStatus already arrived
-                    if let Some((order, _)) = self.pending_order_statuses.remove(&oid) {
-                        // Both arrived - add order immediately!
-                        let time = order.time.and_utc().timestamp_millis();
-                        let order_coin = Coin::new(&order.order.coin);
-                        let mut inner_order: InnerL4Order = order.try_into()?;
-                        inner_order.modify_sz(sz);
-                        #[allow(clippy::unwrap_used)]
-                        inner_order.convert_trigger(time.try_into().unwrap());
-                        let px = inner_order.limit_px();
-                        let anchor = insert_before.clone();
-                        if self.order_book.add_order_before(inner_order, insert_before) {
-                            self.note_insert_before_fallback(&oid, &order_coin, anchor.as_ref(), px);
-                        } else if anchor.is_some() {
-                            crate::metrics::INSERT_BEFORE_HONORED_TOTAL.inc();
-                        }
-                        changed_coins.insert(order_coin.clone());
-                        log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
-                    } else {
-                        // Status hasn't arrived yet - cache the diff size + queue anchor
-                        self.pending_new_diffs.insert(oid.clone(), (sz, insert_before, Instant::now()));
+                    if self.order_book.contains(&coin, &oid) {
+                        // Duplicate New (re-sync overlap replay): the add would be
+                        // ignored - leave the pending status and the wait untouched.
+                        crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["duplicate_new"]).inc();
+                        continue;
                     }
+                    // The status' metadata when it already came (and parses), else
+                    // the diff's own fields until it does.
+                    let from_status = self.pending_order_statuses.remove(&oid).and_then(|(status, _)| {
+                        let t = status.time.and_utc().timestamp_millis();
+                        match InnerL4Order::try_from(status) {
+                            Ok(mut o) => {
+                                o.convert_trigger(t.max(0) as u64);
+                                Some(o)
+                            }
+                            Err(err) => {
+                                crate::metrics::PARSE_ERRORS_TOTAL.with_label_values(&["status_meta"]).inc();
+                                log::warn!("Unparseable status for oid={oid:?}: {err}");
+                                None
+                            }
+                        }
+                    });
+                    let placeholder = from_status.is_none();
+                    let mut order = match from_status {
+                        Some(mut o) => {
+                            // the diff is the book's truth for side and price
+                            let px = crate::order_book::Px::parse_from_str(&diff.px)?;
+                            if diff.side.is_some_and(|s| s != o.side) || px != o.limit_px {
+                                crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["status_px_mismatch"]).inc();
+                            }
+                            if let Some(side) = diff.side {
+                                o.side = side;
+                            }
+                            o.limit_px = px;
+                            o
+                        }
+                        None => InnerL4Order::from_new_diff(&diff, time)?,
+                    };
+                    order.modify_sz(sz);
+                    let px = order.limit_px();
+                    let anchor = insert_before.clone();
+                    if self.order_book.add_order_before(order, insert_before) {
+                        self.note_insert_before_fallback(&oid, &coin, anchor.as_ref(), px);
+                    } else if anchor.is_some() {
+                        crate::metrics::INSERT_BEFORE_HONORED_TOTAL.inc();
+                    }
+                    // wait for the status only for an order that actually rests
+                    if placeholder && self.order_book.contains(&coin, &oid) {
+                        self.awaiting_status.insert(oid, (coin.clone(), Instant::now()));
+                    }
+                    changed_coins.insert(coin);
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
-                    let _ = self.order_book.modify_sz(oid, coin.clone(), new_sz);
+                    if new_sz.value() == 0 && self.awaiting_status.remove(&oid).is_some() {
+                        crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["removed_before_status"]).inc();
+                    }
+                    if !self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
+                        crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["update_unknown_oid"]).inc();
+                    } else if new_sz.value() == 0 {
+                        if self.zeroed_by_update.len() > 1_000_000 {
+                            self.zeroed_by_update.clear(); // backstop; only relabels a later Remove
+                        }
+                        self.zeroed_by_update.insert(oid);
+                    }
                     changed_coins.insert(coin);
                 }
                 InnerOrderDiff::Remove => {
-                    let _ = self.order_book.cancel_order(oid.clone(), coin.clone());
+                    if self.awaiting_status.remove(&oid).is_some() {
+                        crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["removed_before_status"]).inc();
+                    }
+                    let zeroed = self.zeroed_by_update.remove(&oid);
+                    if !self.order_book.cancel_order(oid, coin.clone()) {
+                        // after an Update to 0 the Remove is expected to find nothing
+                        let kind = if zeroed { "remove_after_zero_update" } else { "remove_unknown_oid" };
+                        crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&[kind]).inc();
+                    }
                     changed_coins.insert(coin);
                 }
             }
@@ -484,6 +510,7 @@ impl OrderBookState {
         Ok(changed_coins)
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -538,6 +565,7 @@ mod tests {
             "oid": oid,
             "px": "100.0",
             "coin": coin,
+            "side": "B",
             "raw_book_diff": diff
         })).unwrap()
     }
@@ -552,11 +580,20 @@ mod tests {
     }
 
     fn make_diff_batch(diffs: Vec<NodeDataOrderDiff>) -> Batch<NodeDataOrderDiff> {
+        // `side` is not serialized (bookDiffs wire format): put it back
+        let events: Vec<serde_json::Value> = diffs
+            .iter()
+            .map(|d| {
+                let mut v = serde_json::to_value(d).unwrap();
+                v["side"] = serde_json::to_value(d.side).unwrap();
+                v
+            })
+            .collect();
         serde_json::from_value(serde_json::json!({
             "local_time": "2024-01-15T10:30:00.000000000",
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": 100,
-            "events": diffs
+            "events": events
         })).unwrap()
     }
 
@@ -570,7 +607,7 @@ mod tests {
         assert_eq!(state.order_count(), 0);
         assert_eq!(state.coin_count(), 0);
         assert_eq!(state.pending_order_statuses_count(), 0);
-        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.awaiting_status_count(), 0);
     }
 
     // ==================== Untriggered Trigger Orders ====================
@@ -847,15 +884,15 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_before_survives_pending_diff_cache() {
+    fn test_insert_before_diff_first_rests_at_once() {
         let mut state = empty_state();
         add_resting_order(&mut state, "BTC", 1);
 
-        // Diff for order 2 arrives BEFORE its status: the anchor must survive the cache
+        // Diff for order 2 arrives BEFORE its status: it rests at once, ahead of its anchor
         let diff = make_order_diff("BTC", 2, OrderDiff::New { sz: "1.0".to_string(), insert_before: Some(1) });
         state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
-        assert_eq!(state.pending_new_diffs_count(), 1);
-        assert_eq!(state.order_count(), 1); // not added yet
+        assert_eq!(state.awaiting_status_count(), 1);
+        assert_eq!(bid_queue_oids(&state, "BTC"), vec![Oid::new(2), Oid::new(1)]);
 
         let status = make_order_status("BTC", 2, "open");
         state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
@@ -889,21 +926,28 @@ mod tests {
     fn test_diff_first_then_status_adds_order() {
         let mut state = empty_state();
 
-        // 1. OrderDiff::New arrives first → size cached
+        // 1. OrderDiff::New arrives first → the order rests at once (book changed)
         let diff = make_order_diff("ETH", 99, OrderDiff::New { sz: "2.0".to_string(), insert_before: None });
         let batch = make_diff_batch(vec![diff]);
         let changed = state.apply_order_diffs_hft(batch).unwrap();
-        assert!(changed.is_empty()); // not added yet
-        assert_eq!(state.pending_new_diffs_count(), 1);
-        assert!(state.pending_new_diffs_has(&Oid::new(99)));
+        assert!(changed.contains(&Coin::new("ETH")));
+        assert_eq!(state.order_count(), 1);
+        assert!(state.awaiting_status_has(&Oid::new(99)));
+        let tif = |state: &OrderBookState| {
+            let (_, _, snap) = state.compute_snapshot_for_coin(&Coin::new("ETH"), PxBand::default()).unwrap();
+            let o = &snap.as_ref()[0][0];
+            (o.tif.clone(), o.sz().to_str())
+        };
+        assert_eq!(tif(&state), (None, "2".to_string()));
 
-        // 2. OrderStatus arrives → order added immediately
+        // 2. OrderStatus arrives → metadata attached, the book does not change
         let status = make_order_status("ETH", 99, "open");
         let batch = make_status_batch(vec![status]);
         let changed = state.apply_order_statuses_hft(batch).unwrap();
-        assert!(changed.contains(&Coin::new("ETH")));
-        assert_eq!(state.pending_new_diffs_count(), 0); // consumed
+        assert!(changed.is_empty());
+        assert_eq!(state.awaiting_status_count(), 0);
         assert_eq!(state.order_count(), 1);
+        assert_eq!(tif(&state), (Some("Gtc".to_string()), "2".to_string()));
     }
 
     // ==================== OrderDiff Update/Remove ====================
@@ -970,7 +1014,8 @@ mod tests {
         let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         assert!(changed.is_empty());
-        assert_eq!(state.pending_new_diffs_count(), 0); // skipped entirely
+        assert_eq!(state.awaiting_status_count(), 0); // skipped entirely
+        assert_eq!(state.order_count(), 0);
     }
 
     #[test]
@@ -978,7 +1023,8 @@ mod tests {
         let mut state = empty_state(); // ignore_spot=false
         let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
         state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
-        assert_eq!(state.pending_new_diffs_count(), 1); // cached
+        assert_eq!(state.order_count(), 1); // rests at once
+        assert_eq!(state.awaiting_status_count(), 1);
     }
 
     // ==================== Height/Time Tracking ====================
@@ -1035,16 +1081,18 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_evicts_aged_diffs_as_data_loss() {
+    fn test_cleanup_status_never_arriving_is_not_data_loss() {
         let mut state = empty_state();
         for i in 0..100u64 {
             let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
         state.age_pending_entries(std::time::Duration::from_secs(61));
-        // A New diff whose status never arrived means the book is missing an order.
-        assert!(state.cleanup_stale_pending(), "aged diff eviction is data loss and must trigger a re-sync");
-        assert_eq!(state.pending_new_diffs_count(), 0);
+        // The orders rest from their diffs; only their L4 metadata is incomplete.
+        assert!(!state.cleanup_stale_pending(), "a missing status is not book data loss");
+        // never aged: a status lagging minutes must still attach
+        assert_eq!(state.awaiting_status_count(), 100);
+        assert_eq!(state.order_count(), 100);
     }
 
     #[test]
@@ -1060,7 +1108,7 @@ mod tests {
         }
         assert!(!state.cleanup_stale_pending());
         assert_eq!(state.pending_order_statuses_count(), 100);
-        assert_eq!(state.pending_new_diffs_count(), 100);
+        assert_eq!(state.awaiting_status_count(), 100);
     }
 
     #[test]
@@ -1105,7 +1153,8 @@ mod tests {
             let mut status = make_order_status("BTC", oid, "open");
             status.order.limit_px = px.to_string();
             state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-            let diff = make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+            let mut diff = make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+            diff.px = px.to_string(); // the diff carries the order's price
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
         let (full_time, full_height, _) =
@@ -1176,7 +1225,7 @@ mod tests {
             elapsed, per_event
         );
         assert_eq!(state.order_count(), 1000);
-        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.awaiting_status_count(), 0);
     }
 
     #[test]
@@ -1194,5 +1243,128 @@ mod tests {
         assert!(universe.contains(&Coin::new("BTC")));
         assert!(universe.contains(&Coin::new("ETH")));
         assert!(universe.contains(&Coin::new("SOL")));
+    }
+
+    // ==================== Diffs outrunning the status pairing ====================
+
+    #[test]
+    fn test_place_and_cancel_in_one_block_never_rests_in_any_arrival_order() {
+        // Shape of a mainnet case (block 1222996474): an ALO bid placed and canceled in one
+        // block. The streams reach the server independently; every merge that keeps each
+        // stream's own order must end with an empty book.
+        let run = |steps: &[u8]| {
+            let mut state = empty_state();
+            for step in steps {
+                match step {
+                    b'N' => {
+                        let new = OrderDiff::New { sz: "10008.0".to_string(), insert_before: None };
+                        state.apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("HYPER", 7, new)])).unwrap();
+                    }
+                    b'R' => {
+                        let remove = make_order_diff("HYPER", 7, OrderDiff::Remove);
+                        state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
+                    }
+                    status => {
+                        let status = if *status == b'o' { "open" } else { "canceled" };
+                        let batch = make_status_batch(vec![make_order_status("HYPER", 7, status)]);
+                        state.apply_order_statuses_hft(batch).unwrap();
+                    }
+                }
+            }
+            (state.order_count(), state.awaiting_status_count(), state.pending_order_statuses_count())
+        };
+        // N = new diff, R = remove diff, o = open status, c = canceled status
+        for steps in ["NRoc", "NoRc", "NocR", "oNRc", "oNcR", "ocNR"] {
+            assert_eq!(run(steps.as_bytes()), (0, 0, 0), "arrival order {steps}");
+        }
+    }
+
+    #[test]
+    fn test_update_before_status_rests_with_the_updated_size() {
+        let mut state = empty_state();
+        let new = make_order_diff("ETH", 7, OrderDiff::New { sz: "2.0".to_string(), insert_before: None });
+        let update =
+            make_order_diff("ETH", 7, OrderDiff::Update { orig_sz: "2.0".to_string(), new_sz: "1.25".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new, update])).unwrap();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("ETH", 7, "open")])).unwrap();
+
+        let (_, _, snapshot) = state.compute_snapshot_for_coin(&Coin::new("ETH"), PxBand::default()).unwrap();
+        let sizes: Vec<String> = snapshot.as_ref()[0].iter().map(|order| order.sz().to_str()).collect();
+        assert_eq!(sizes, vec!["1.25"]);
+    }
+
+    #[test]
+    fn test_resync_overlap_remove_of_resting_order_also_clears_its_pending_new() {
+        // A re-sync replay re-applies blocks the snapshot already contains: the order is
+        // resting AND its replayed New diff waits for the status. The Remove must clear both.
+        let mut state = empty_state();
+        add_resting_order(&mut state, "ETH", 7);
+        let new = make_order_diff("ETH", 7, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        state.apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("ETH", 7, OrderDiff::Remove)])).unwrap();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("ETH", 7, "open")])).unwrap();
+        assert_eq!(state.order_count(), 0);
+    }
+
+    fn meta_of(state: &OrderBookState, coin: &str, oid: u64) -> Option<InnerL4Order> {
+        let (_, _, snap) = state.compute_snapshot_for_coin(&Coin::new(coin), PxBand::default())?;
+        snap.as_ref().iter().flatten().find(|o| o.oid == oid).cloned()
+    }
+
+    #[test]
+    fn test_new_diff_without_any_resting_status_rests_and_a_later_cancel_does_not_attach() {
+        // mainnet: system spot orders on @107 get a New diff, never an "open" status
+        let mut state = empty_state();
+        let new = make_order_diff("@107", 5, OrderDiff::New { sz: "3.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("@107", 5, "canceled")])).unwrap();
+        assert_eq!(state.order_count(), 1);
+        assert_eq!(state.awaiting_status_count(), 1, "a non-resting status never attaches");
+        assert_eq!(meta_of(&state, "@107", 5).unwrap().tif, None);
+        state.apply_order_diffs_hft(make_diff_batch(vec![make_order_diff("@107", 5, OrderDiff::Remove)])).unwrap();
+        assert_eq!((state.order_count(), state.awaiting_status_count()), (0, 0));
+    }
+
+    #[test]
+    fn test_resting_status_without_new_diff_is_an_orphan_and_never_touches_the_book() {
+        // open -> filled in the same block: no New diff ever
+        let mut state = empty_state();
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 9, "open")])).unwrap();
+        assert_eq!((state.order_count(), state.pending_order_statuses_count()), (0, 1));
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 9, "filled")])).unwrap();
+        assert_eq!((state.order_count(), state.pending_order_statuses_count()), (0, 0));
+    }
+
+    #[test]
+    fn test_trigger_order_with_lagging_statuses_gets_the_triggered_metadata() {
+        // the diff rests the triggered order first; the statuses arrive later,
+        // the pre-trigger "open" (isTrigger) first, then "triggered"
+        let mut state = empty_state();
+        let new = make_order_diff("ETH", 11, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        let mut open = make_order_status("ETH", 11, "open");
+        open.order.is_trigger = true;
+        open.order.trigger_condition = "Price above 110".to_string();
+        open.order.trigger_px = "110.0".to_string();
+        state.apply_order_statuses_hft(make_status_batch(vec![open.clone()])).unwrap();
+        assert_eq!(state.awaiting_status_count(), 1, "the pre-trigger open must not attach");
+        let mut triggered = open;
+        triggered.status = "triggered".to_string();
+        state.apply_order_statuses_hft(make_status_batch(vec![triggered])).unwrap();
+        assert_eq!(state.awaiting_status_count(), 0);
+        let o = meta_of(&state, "ETH", 11).unwrap();
+        assert_eq!((o.is_trigger, o.trigger_condition.as_str(), o.sz.to_str()), (false, "Triggered", "1".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_new_keeps_the_pending_status() {
+        let mut state = empty_state();
+        add_resting_order(&mut state, "BTC", 3);
+        state.apply_order_statuses_hft(make_status_batch(vec![make_order_status("BTC", 3, "open")])).unwrap();
+        let new = make_order_diff("BTC", 3, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        assert_eq!(state.order_count(), 1);
+        assert_eq!(state.awaiting_status_count(), 0, "a duplicate New must not start a wait");
+        assert_eq!(state.pending_order_statuses_count(), 1, "nor consume the pending status");
     }
 }

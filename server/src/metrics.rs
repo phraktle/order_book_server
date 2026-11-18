@@ -113,7 +113,7 @@ lazy_static! {
     /// Pending order diffs in HFT cache
     pub static ref PENDING_DIFFS_CACHE: IntGauge = IntGauge::new(
         "pending_diffs_cache_size",
-        "Pending order diffs in HFT cache"
+        "Resting orders still awaiting their status (L4 metadata only; the book does not wait)"
     ).expect("metric can be created");
 
     /// Broadcast channel lag (receivers behind)
@@ -164,6 +164,16 @@ lazy_static! {
     pub static ref INSERT_BEFORE_FALLBACK_TOTAL: IntCounter = IntCounter::new(
         "insert_before_fallback_total",
         "New diffs whose insertBefore anchor was missing; order rested at back of level"
+    ).expect("metric can be created");
+
+    pub static ref DIFF_ANOMALY_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("diff_anomaly_total", "Book-diff events that should not happen with a consistent book (matched_on_insert, update/remove_unknown_oid, duplicate_new) and resting orders removed before their status attached (removed_before_status)"),
+        &["kind"]
+    ).expect("metric can be created");
+
+    pub static ref STATUS_DROPPED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("status_dropped_total", "Order-status batches dropped (L4 metadata only, never book state)"),
+        &["reason"]
     ).expect("metric can be created");
 
     // ==================== FILE WATCHER METRICS ====================
@@ -311,6 +321,8 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(CHANNEL_DROPS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_DESYNCS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_FALLBACK_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(DIFF_ANOMALY_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(STATUS_DROPPED_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_HONORED_TOTAL.clone())).ok();
 
     // File watcher metrics
