@@ -453,12 +453,21 @@ impl OrderBookState {
                             }
                         }
                     });
+                    let placeholder = from_status.is_none();
                     let mut order = match from_status {
-                        Some(o) => o,
-                        None => {
-                            self.awaiting_status.insert(oid.clone(), (coin.clone(), Instant::now()));
-                            InnerL4Order::from_new_diff(&diff, time)?
+                        Some(mut o) => {
+                            // the diff is the book's truth for side and price
+                            let px = crate::order_book::Px::parse_from_str(&diff.px)?;
+                            if diff.side.is_some_and(|s| s != o.side) || px != o.limit_px {
+                                crate::metrics::DIFF_ANOMALY_TOTAL.with_label_values(&["status_px_mismatch"]).inc();
+                            }
+                            if let Some(side) = diff.side {
+                                o.side = side;
+                            }
+                            o.limit_px = px;
+                            o
                         }
+                        None => InnerL4Order::from_new_diff(&diff, time)?,
                     };
                     order.modify_sz(sz);
                     let px = order.limit_px();
@@ -467,6 +476,10 @@ impl OrderBookState {
                         self.note_insert_before_fallback(&oid, &coin, anchor.as_ref(), px);
                     } else if anchor.is_some() {
                         crate::metrics::INSERT_BEFORE_HONORED_TOTAL.inc();
+                    }
+                    // wait for the status only for an order that actually rests
+                    if placeholder && self.order_book.contains(&coin, &oid) {
+                        self.awaiting_status.insert(oid, (coin.clone(), Instant::now()));
                     }
                     changed_coins.insert(coin);
                 }
@@ -1139,7 +1152,8 @@ mod tests {
             let mut status = make_order_status("BTC", oid, "open");
             status.order.limit_px = px.to_string();
             state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
-            let diff = make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+            let mut diff = make_order_diff("BTC", oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+            diff.px = px.to_string(); // the diff carries the order's price
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
         let (full_time, full_height, _) =

@@ -1025,7 +1025,7 @@ impl OrderBookListener {
         } else if matches!(event_batch, EventBatch::Orders(_)) {
             // Statuses carry L4 metadata only, never book state: a late one is
             // dropped (counted), never a reason to re-sync the book.
-            crate::metrics::PARSE_ERRORS_TOTAL.with_label_values(&["late_backfill_status"]).inc();
+            crate::metrics::STATUS_DROPPED_TOTAL.with_label_values(&["late_backfill"]).inc();
         } else {
             self.mark_desynced("late_backfill");
         }

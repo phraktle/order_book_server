@@ -172,8 +172,13 @@ lazy_static! {
     ).expect("metric can be created");
 
     pub static ref DIFF_TO_BBO_SECONDS: Histogram = Histogram::with_opts(
-        HistogramOpts::new("diff_to_bbo_seconds", "Node write time of a diff line (local_time) to its bbo broadcast")
-            .buckets(vec![0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0])
+        HistogramOpts::new("diff_to_bbo_seconds", "Node write time of a diff line (local_time) to the end of its apply incl. the bbo send when a bbo subscriber exists; observed for every live diff batch")
+            .buckets(vec![0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0])
+    ).expect("metric can be created");
+
+    pub static ref STATUS_DROPPED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("status_dropped_total", "Order-status batches dropped (L4 metadata only, never book state)"),
+        &["reason"]
     ).expect("metric can be created");
 
     pub static ref STATUS_LAG_BLOCKS: IntGauge = IntGauge::new(
@@ -328,6 +333,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(DIFF_ANOMALY_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(DIFF_TO_BBO_SECONDS.clone())).ok();
     REGISTRY.register(Box::new(STATUS_LAG_BLOCKS.clone())).ok();
+    REGISTRY.register(Box::new(STATUS_DROPPED_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(INSERT_BEFORE_HONORED_TOTAL.clone())).ok();
 
     // File watcher metrics
