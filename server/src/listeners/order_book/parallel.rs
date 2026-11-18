@@ -48,6 +48,51 @@ fn extract_block_number(line: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+/// Byte offset of the first complete line whose block height is above
+/// `min_height`, by bisection over the (height-ordered) file. Lines without a
+/// parsable height count as above the floor (read rather than skipped).
+fn first_line_above(file: &mut File, min_height: u64) -> std::io::Result<u64> {
+    use std::io::BufRead;
+    let len = file.metadata()?.len();
+    // (line start, its height) of the first complete line starting at or after `off`
+    let mut probe = |off: u64| -> std::io::Result<(u64, Option<u64>)> {
+        file.seek(SeekFrom::Start(off))?;
+        let mut r = std::io::BufReader::with_capacity(1 << 16, &mut *file);
+        let mut start = off;
+        let mut skipped = Vec::new();
+        if off > 0 {
+            start += r.read_until(b'\n', &mut skipped)? as u64;
+        }
+        let mut head = Vec::with_capacity(512);
+        r.by_ref().take(512).read_until(b'\n', &mut head)?;
+        let h = std::str::from_utf8(&head).ok().and_then(|t| {
+            let i = t.find("\"block_number\":")?;
+            let rest = &t[i + 15..];
+            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        });
+        Ok((start, h))
+    };
+    let (first, h0) = probe(0)?;
+    if h0.is_none_or(|h| h > min_height) {
+        return Ok(first);
+    }
+    // invariant: the line at/after `lo` is at or below the floor; `hi` is past it
+    let (mut lo, mut hi) = (0_u64, len);
+    while hi - lo > 1 << 16 {
+        let mid = lo + (hi - lo) / 2;
+        let (_, h) = probe(mid)?;
+        if h.is_none_or(|h| h > min_height) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    // the line containing/after `lo` is at or below the floor: walk forward
+    // (backfill_and_track filters by height again, so landing early is safe)
+    Ok(probe(lo)?.0)
+}
+
 /// Block height of the first line in `path`, read from the head of the file.
 /// 8 KB is far beyond where `block_number` sits in the line header.
 fn first_block_number(path: &std::path::Path) -> Option<u64> {
@@ -205,9 +250,17 @@ impl FileReader {
         for path in &included {
             let is_newest = *path == newest;
             match File::open(path) {
-                Ok(file) => {
-                    let mut buf_reader = std::io::BufReader::new(file);
-                    let mut pos: u64 = 0;
+                Ok(mut file) => {
+                    // Lines are height-ordered: bisect to the first line above
+                    // the floor instead of scanning the hour from its start
+                    // (tens of GB of statuses at the end of a busy hour).
+                    let start = first_line_above(&mut file, min_height).unwrap_or(0);
+                    if file.seek(SeekFrom::Start(start)).is_err() {
+                        error!("Backfill seek failed on {}", path.display());
+                        continue;
+                    }
+                    let mut buf_reader = std::io::BufReader::with_capacity(1 << 20, file);
+                    let mut pos: u64 = start;
                     loop {
                         let mut line = String::new();
                         match std::io::BufRead::read_line(&mut buf_reader, &mut line) {
@@ -1008,6 +1061,39 @@ mod tests {
         // and only thing on_modify returns (no skip, no double-read).
         append(&path, &format!("{}\n", bn_line(20)));
         assert_eq!(reader.on_modify(), vec![bn_line(20)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_backfill_bisects_a_large_file_to_the_floor() {
+        // 200k lines (~6 MB): the bisection must land on the floor exactly,
+        // whatever padding the lines carry, and read nothing below it.
+        let dir = test_dir("backfill_bisect");
+        let day = dir.join("hourly").join("20240101");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join("0");
+        let mut body = String::new();
+        for h in 1..=200_000_u64 {
+            let pad = "x".repeat((h % 37) as usize);
+            body.push_str(&format!("{{\"block_number\":{h},\"pad\":\"{pad}\"}}\n"));
+        }
+        append(&path, &body);
+        for floor in [0_u64, 1, 99_999, 199_999, 200_000] {
+            let mut file = File::open(&path).unwrap();
+            let off = first_line_above(&mut file, floor).unwrap();
+            let rest = &body[off as usize..];
+            let first = extract_block_number(rest.lines().next().unwrap_or("")).unwrap_or(u64::MAX);
+            assert!(first <= floor + 1, "floor {floor}: started at {first}");
+            assert!(off == 0 || floor + 1 - first <= 200_000, "sanity");
+            let mut reader = FileReader::new(dir.clone());
+            let mut n = 0_u64;
+            assert!(reader.backfill_and_track(floor, &mut |line| {
+                assert!(extract_block_number(&line).unwrap() > floor);
+                n += 1;
+                true
+            }));
+            assert_eq!(n, 200_000 - floor.min(200_000), "floor {floor}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
